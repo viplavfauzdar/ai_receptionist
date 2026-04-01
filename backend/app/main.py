@@ -23,6 +23,15 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root():
+    return {
+        "name": "AI Receptionist MVP",
+        "status": "ok",
+        "health": "/health",
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "business_name": settings.business_name}
