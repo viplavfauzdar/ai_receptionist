@@ -7,10 +7,6 @@ from sqlalchemy.orm import Session
 from twilio.twiml.voice_response import Gather, VoiceResponse
 
 from .ai import (
-    DEFAULT_BOOKING_ENABLED,
-    DEFAULT_BUSINESS_GREETING,
-    DEFAULT_BUSINESS_HOURS,
-    DEFAULT_BUSINESS_NAME,
     BusinessContext,
     SessionContext,
     detect_and_respond,
@@ -52,24 +48,42 @@ def health():
 def _normalize_phone_number(value: str | None) -> str:
     if not value:
         return ""
-    return "".join(char for char in value if char.isdigit())
+    digits = "".join(char for char in value.strip() if char.isdigit())
+    if len(digits) == 11 and digits.startswith("1"):
+        return digits[1:]
+    return digits
+
+
+def _log_voice(message: str) -> None:
+    print(f"[voice] {message}", flush=True)
 
 
 def _resolve_business(db: Session, to_number: str | None) -> Business | None:
     if not to_number:
+        _log_voice("business_lookup skipped reason=missing_to_number")
         return None
 
     business = db.query(Business).filter(Business.twilio_number == to_number).first()
     if business:
+        _log_voice(
+            f"business_lookup matched mode=exact to_number={to_number} business_id={business.id} business_name={business.name}"
+        )
         return business
 
     normalized_target = _normalize_phone_number(to_number)
     if not normalized_target:
+        _log_voice(f"business_lookup skipped reason=empty_normalized_to_number raw_to_number={to_number}")
         return None
 
     for candidate in db.query(Business).all():
         if _normalize_phone_number(candidate.twilio_number) == normalized_target:
+            _log_voice(
+                "business_lookup matched "
+                f"mode=normalized to_number={to_number} normalized_to_number={normalized_target} "
+                f"business_id={candidate.id} business_name={candidate.name} stored_twilio_number={candidate.twilio_number}"
+            )
             return candidate
+    _log_voice(f"business_lookup missed to_number={to_number} normalized_to_number={normalized_target}")
     return None
 
 
@@ -79,11 +93,11 @@ def _build_business_context(business: Business | None) -> BusinessContext:
 
     return BusinessContext(
         id=business.id,
-        name=business.name or DEFAULT_BUSINESS_NAME,
+        name=business.name or settings.business_name,
         twilio_number=business.twilio_number,
         forwarding_number=business.forwarding_number,
-        greeting=business.greeting or DEFAULT_BUSINESS_GREETING,
-        business_hours=business.business_hours or DEFAULT_BUSINESS_HOURS,
+        greeting=business.greeting or settings.business_greeting,
+        business_hours=business.business_hours or settings.business_hours,
         booking_enabled=business.booking_enabled,
         knowledge_text=business.knowledge_text or "",
     )
@@ -205,6 +219,13 @@ def _build_speech_safe_response(result_intent: str, result_state: str, response:
 @app.post("/voice")
 async def voice(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
+    form_data = {key: form.get(key) for key in form.keys()}
+    _log_voice(
+        "incoming_form "
+        f"keys={sorted(form_data.keys())} "
+        f"CallSid={form_data.get('CallSid')} From={form_data.get('From')} To={form_data.get('To')} "
+        f"CallStatus={form_data.get('CallStatus')} SpeechResult={form_data.get('SpeechResult')!r}"
+    )
 
     speech = form.get("SpeechResult", "")
     call_sid = form.get("CallSid")
@@ -215,6 +236,12 @@ async def voice(request: Request, db: Session = Depends(get_db)):
     session_context = _build_session_context(session)
     business = _resolve_business(db, to_number)
     business_context = _build_business_context(business)
+    _log_voice(
+        "request "
+        f"call_sid={call_sid} from_number={from_number} to_number={to_number} "
+        f"speech_present={bool(speech)} business_id={business_context.id} business_name={business_context.name} "
+        f"greeting={business_context.greeting!r}"
+    )
 
     response = VoiceResponse()
 
@@ -325,8 +352,8 @@ def create_business(payload: BusinessCreate, db: Session = Depends(get_db)):
         name=payload.name,
         twilio_number=payload.twilio_number,
         forwarding_number=payload.forwarding_number,
-        greeting=payload.greeting or DEFAULT_BUSINESS_GREETING,
-        business_hours=payload.business_hours or DEFAULT_BUSINESS_HOURS,
+        greeting=payload.greeting or settings.business_greeting,
+        business_hours=payload.business_hours or settings.business_hours,
         booking_enabled=payload.booking_enabled,
         knowledge_text=payload.knowledge_text,
     )
@@ -352,12 +379,12 @@ def create_demo_business(
         return existing
 
     row = Business(
-        name=DEFAULT_BUSINESS_NAME,
+        name=settings.business_name,
         twilio_number=twilio_number,
         forwarding_number=forwarding_number,
-        greeting=DEFAULT_BUSINESS_GREETING,
-        business_hours=DEFAULT_BUSINESS_HOURS,
-        booking_enabled=DEFAULT_BOOKING_ENABLED,
+        greeting=settings.business_greeting,
+        business_hours=settings.business_hours,
+        booking_enabled=settings.booking_enabled,
         knowledge_text="Answer using the business details configured for this tenant.",
     )
     db.add(row)

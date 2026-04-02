@@ -13,11 +13,6 @@ INTENTS = {
     "GENERAL_QUESTION",
 }
 
-DEFAULT_BUSINESS_NAME = "Bright Smile Dental"
-DEFAULT_BUSINESS_GREETING = "Hello, thanks for calling Bright Smile Dental. How can I help you today?"
-DEFAULT_BUSINESS_HOURS = "Mon-Fri 9 AM to 5 PM"
-DEFAULT_BOOKING_ENABLED = True
-
 
 def _log_ai_mode(message: str) -> None:
     print(f"[ai] {message}", flush=True)
@@ -37,12 +32,12 @@ class ReceptionistResult:
 @dataclass
 class BusinessContext:
     id: int | None = None
-    name: str = DEFAULT_BUSINESS_NAME
+    name: str = settings.business_name
     twilio_number: str | None = None
     forwarding_number: str | None = None
-    greeting: str = DEFAULT_BUSINESS_GREETING
-    business_hours: str = DEFAULT_BUSINESS_HOURS
-    booking_enabled: bool = DEFAULT_BOOKING_ENABLED
+    greeting: str = settings.business_greeting
+    business_hours: str = settings.business_hours
+    booking_enabled: bool = settings.booking_enabled
     knowledge_text: str = ""
     metadata: dict[str, str] = field(default_factory=dict)
 

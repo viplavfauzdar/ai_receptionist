@@ -73,6 +73,10 @@ For LLM mode, edit `backend/.env` before starting the server and set a real Open
 ```env
 OPENAI_API_KEY=your_real_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
+BUSINESS_NAME=Bright Smile Dental
+BUSINESS_GREETING=Hello, thanks for calling Bright Smile Dental. How can I help you today?
+BUSINESS_HOURS=Mon-Fri 9 AM to 5 PM
+BOOKING_ENABLED=true
 DATABASE_URL=sqlite:///./receptionist.db
 ```
 
@@ -90,7 +94,7 @@ Behavior:
 
 - Supported intents are `BOOK_APPOINTMENT`, `BUSINESS_HOURS`, `CALLBACK_REQUEST`, and `GENERAL_QUESTION`.
 - If `OPENAI_API_KEY` is missing or the OpenAI request fails, the backend falls back to simple rule-based intent detection and short canned replies.
-- Business profile data now comes from the `businesses` table, not from `.env`.
+- Business profile data is resolved from the `businesses` table first, with `.env` fallback defaults when no business row matches.
 - The `state` value is persisted so the next `/voice` turn can continue from the prior step instead of restarting.
 
 ## 2) Expose locally to Twilio
@@ -125,6 +129,10 @@ Open:
 Backend `.env`:
 - `OPENAI_API_KEY` required for real LLM mode
 - `OPENAI_MODEL=gpt-4o-mini`
+- `BUSINESS_NAME=Bright Smile Dental`
+- `BUSINESS_GREETING=Hello, thanks for calling Bright Smile Dental. How can I help you today?`
+- `BUSINESS_HOURS=Mon-Fri 9 AM to 5 PM`
+- `BOOKING_ENABLED=true`
 - `DATABASE_URL=sqlite:///./receptionist.db`
 
 Frontend `.env.local`:
@@ -135,7 +143,7 @@ Frontend `.env.local`:
 - This MVP uses SQLite at `backend/receptionist.db`.
 - Multi-tenant mode is basic: one incoming Twilio number maps to one business record.
 - Call sessions are persisted locally in SQLite and keyed by `CallSid`.
-- Business names, greetings, hours, booking settings, and knowledge text are stored in the database.
+- Business names, greetings, hours, booking settings, and knowledge text are stored in the database, with env-backed fallback defaults if no business matches.
 - Appointment booking is intentionally simple: it captures requested time and caller info.
 - The Twilio voice webhook contract remains `POST /voice`.
 - The receptionist is LLM-first when `OPENAI_API_KEY` is configured.
@@ -190,3 +198,30 @@ curl -X POST http://127.0.0.1:8000/api/businesses \
 - multi-tenant business configs
 - Twilio request validation
 - role-based auth
+
+## 8) Backend Tests
+
+Install backend dependencies into the backend virtualenv:
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Run the backend test suite:
+
+```bash
+backend/.venv/bin/python -m pytest backend/tests -q
+```
+
+Run the backend test suite with coverage:
+
+```bash
+backend/.venv/bin/python -m pytest backend/tests \
+  --cov=backend/app \
+  --cov-report=term-missing
+```
+
+Current backend coverage target is measured against `backend/app`.
