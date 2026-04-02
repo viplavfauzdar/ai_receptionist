@@ -105,6 +105,7 @@ If a change affects Twilio flow, verify:
 - If both frontend and backend need updates, keep API contracts explicit and synchronized.
 - Document any new env vars in `README.md`.
 - If a change affects system architecture, call flow, persistence, state handling, integration boundaries, or other developer-facing backend design, update `ARCHITECTURE.md` in the same change.
+- Required documentation updates must be committed in the same change as the code they describe. Do not defer `README.md` or `ARCHITECTURE.md` updates to a later commit.
 
 ## Agent Operating Rules
 
