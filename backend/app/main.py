@@ -271,6 +271,12 @@ def _calendar_unavailable_response() -> str:
     return "That time looks unavailable. Please suggest another time."
 
 
+def _calendar_unavailable_with_suggestion_response(suggested_slot: str | None) -> str:
+    if suggested_slot:
+        return f"That time looks unavailable. I could offer {suggested_slot}. Would that work?"
+    return _calendar_unavailable_response()
+
+
 def _get_silence_count(slot_data: dict[str, str]) -> int:
     raw_value = slot_data.get("silence_count", "0")
     try:
@@ -450,6 +456,9 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                     end=requested_end,
                 )
                 if not availability.available:
+                    speech_safe_response = _calendar_unavailable_with_suggestion_response(
+                        availability.suggested_slots[0] if availability.suggested_slots else None
+                    )
                     raise CalendarServiceError("Requested appointment window overlaps an existing calendar event.")
                 calendar_booking = create_calendar_booking(
                     caller_name=merged_slot_data.get("caller_name"),
@@ -470,7 +479,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
             except CalendarServiceError as exc:
                 _log_voice(f"calendar_booking_failed reason=calendar_service_error error={exc}")
                 if "overlaps an existing calendar event" in str(exc):
-                    speech_safe_response = _calendar_unavailable_response()
+                    speech_safe_response = speech_safe_response or _calendar_unavailable_response()
                 else:
                     speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
             except Exception as exc:

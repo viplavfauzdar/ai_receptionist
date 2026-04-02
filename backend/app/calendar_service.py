@@ -33,6 +33,7 @@ class CalendarBookingResult:
 class CalendarAvailabilityResult:
     available: bool
     conflicting_events: list[dict[str, str]]
+    suggested_slots: list[str]
 
 
 def _resolve_day(appointment_day: str, now: datetime) -> datetime:
@@ -128,35 +129,72 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=credentials)
 
 
+def _parse_event_datetime(value: str, timezone_str: str) -> datetime:
+    if "T" in value:
+        return datetime.fromisoformat(value)
+    return datetime.fromisoformat(f"{value}T00:00:00").replace(tzinfo=ZoneInfo(timezone_str))
+
+
+def _events_overlap(existing_start: datetime, existing_end: datetime, requested_start: datetime, requested_end: datetime) -> bool:
+    return existing_start < requested_end and requested_start < existing_end
+
+
+def _format_suggested_slot(start: datetime) -> str:
+    formatted_time = start.strftime("%I:%M %p").lstrip("0").replace(":00 ", " ")
+    return f"{start.strftime('%A')} at {formatted_time}"
+
+
 def check_calendar_availability(*, start: datetime, end: datetime) -> CalendarAvailabilityResult:
     service = get_calendar_service()
+    search_end = end + timedelta(hours=4)
     response = (
         service.events()
         .list(
             calendarId=settings.google_calendar_id,
             timeMin=start.isoformat(),
-            timeMax=end.isoformat(),
+            timeMax=search_end.isoformat(),
             singleEvents=True,
             orderBy="startTime",
         )
         .execute()
     )
 
+    active_events: list[tuple[datetime, datetime, dict[str, str]]] = []
     conflicts: list[dict[str, str]] = []
     for event in response.get("items", []):
         if event.get("status") == "cancelled":
             continue
         conflict_start = (event.get("start") or {}).get("dateTime") or (event.get("start") or {}).get("date")
         conflict_end = (event.get("end") or {}).get("dateTime") or (event.get("end") or {}).get("date")
-        conflicts.append(
-            {
-                "id": event.get("id", ""),
-                "summary": event.get("summary", ""),
-                "start": conflict_start or "",
-                "end": conflict_end or "",
-            }
-        )
-    return CalendarAvailabilityResult(available=not conflicts, conflicting_events=conflicts)
+        if not conflict_start or not conflict_end:
+            continue
+        parsed_start = _parse_event_datetime(conflict_start, settings.google_timezone)
+        parsed_end = _parse_event_datetime(conflict_end, settings.google_timezone)
+        event_payload = {
+            "id": event.get("id", ""),
+            "summary": event.get("summary", ""),
+            "start": conflict_start,
+            "end": conflict_end,
+        }
+        active_events.append((parsed_start, parsed_end, event_payload))
+        if _events_overlap(parsed_start, parsed_end, start, end):
+            conflicts.append(event_payload)
+
+    if not conflicts:
+        return CalendarAvailabilityResult(available=True, conflicting_events=[], suggested_slots=[])
+
+    duration = end - start
+    candidate_start = start
+    candidate_end = end
+    for event_start, event_end, _ in sorted(active_events, key=lambda item: item[0]):
+        if _events_overlap(event_start, event_end, candidate_start, candidate_end):
+            candidate_start = event_end
+            candidate_end = candidate_start + duration
+
+    suggested_slots = []
+    if candidate_start != start:
+        suggested_slots.append(_format_suggested_slot(candidate_start))
+    return CalendarAvailabilityResult(available=False, conflicting_events=conflicts, suggested_slots=suggested_slots)
 
 
 def create_calendar_booking(

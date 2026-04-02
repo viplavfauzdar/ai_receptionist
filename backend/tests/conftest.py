@@ -122,7 +122,14 @@ def twilio_signature():
 
 @pytest.fixture
 def mock_calendar_booking(monkeypatch: pytest.MonkeyPatch):
-    def _apply(*, result=None, error: Exception | None = None, availability_error: Exception | None = None, available: bool = True):
+    def _apply(
+        *,
+        result=None,
+        error: Exception | None = None,
+        availability_error: Exception | None = None,
+        available: bool = True,
+        suggested_slots: list[str] | None = None,
+    ):
         monkeypatch.setattr(main_module.settings, "google_calendar_enabled", True)
 
         def _fake_check_calendar_availability(**_: object):
@@ -131,6 +138,7 @@ def mock_calendar_booking(monkeypatch: pytest.MonkeyPatch):
             return calendar_module.CalendarAvailabilityResult(
                 available=available,
                 conflicting_events=[] if available else [{"id": "evt_conflict", "summary": "Booked"}],
+                suggested_slots=suggested_slots or [],
             )
 
         def _fake_create_calendar_booking(**_: object):

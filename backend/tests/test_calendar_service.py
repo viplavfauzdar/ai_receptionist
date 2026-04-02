@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -133,10 +133,10 @@ def test_check_calendar_availability_returns_available_when_no_conflicts(monkeyp
     end = datetime(2026, 4, 7, 15, 30, tzinfo=ZoneInfo("America/New_York"))
     result = check_calendar_availability(start=start, end=end)
 
-    assert result == CalendarAvailabilityResult(available=True, conflicting_events=[])
+    assert result == CalendarAvailabilityResult(available=True, conflicting_events=[], suggested_slots=[])
     assert captured["calendarId"] == "primary"
     assert captured["timeMin"] == start.isoformat()
-    assert captured["timeMax"] == end.isoformat()
+    assert captured["timeMax"] == (end + timedelta(hours=4)).isoformat()
 
 
 def test_check_calendar_availability_blocks_overlapping_events_and_ignores_cancelled(monkeypatch: pytest.MonkeyPatch):
@@ -150,6 +150,13 @@ def test_check_calendar_availability_blocks_overlapping_events_and_ignores_cance
                         "status": "confirmed",
                         "start": {"dateTime": "2026-04-07T15:15:00-04:00"},
                         "end": {"dateTime": "2026-04-07T15:45:00-04:00"},
+                    },
+                    {
+                        "id": "evt_followup",
+                        "summary": "Followup",
+                        "status": "confirmed",
+                        "start": {"dateTime": "2026-04-07T15:45:00-04:00"},
+                        "end": {"dateTime": "2026-04-07T16:15:00-04:00"},
                     },
                     {
                         "id": "evt_cancelled",
@@ -185,6 +192,7 @@ def test_check_calendar_availability_blocks_overlapping_events_and_ignores_cance
             "end": "2026-04-07T15:45:00-04:00",
         }
     ]
+    assert result.suggested_slots == ["Tuesday at 4:15 PM"]
 
 
 def test_check_calendar_availability_allows_exact_boundary_gap(monkeypatch: pytest.MonkeyPatch):
@@ -208,6 +216,7 @@ def test_check_calendar_availability_allows_exact_boundary_gap(monkeypatch: pyte
     )
 
     assert result.available is True
+    assert result.suggested_slots == []
 
 
 def test_get_calendar_service_uses_loaded_credentials(monkeypatch: pytest.MonkeyPatch):

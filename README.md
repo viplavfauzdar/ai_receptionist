@@ -120,6 +120,7 @@ Behavior:
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
 - When Google Calendar is enabled and a booking is complete, the backend creates a real calendar event and confirms it to the caller. If calendar creation fails, the request is still saved and the caller gets a fallback confirmation.
 - Before creating the Google Calendar event, the backend checks the requested window for conflicts. If the slot overlaps an existing active event, the backend does not create the event and asks the caller for another time.
+- When the calendar service can infer a nearby opening after the conflicting event chain, the receptionist offers that suggested slot in the spoken response.
 
 ## 2) Expose locally to Twilio
 
@@ -237,10 +238,12 @@ curl -X POST http://127.0.0.1:8000/api/businesses \
 ```
 
 ## 7) Suggested next upgrades
-- Google Calendar integration
+- Per-business Google Calendar OAuth (current implementation uses a single token.json — blocks multi-tenant calendar booking)
+- Twilio status callback handling to mark dropped sessions inactive and surface incomplete bookings
 - Stripe billing
-- multi-tenant business configs
-- role-based auth
+- Role-based auth on admin API routes (/api/businesses, /api/calls, /api/appointments are currently unprotected)
+- Postgres (replace SQLite before any production deployment)
+- CRM integration (HubSpot, Salesforce, Jobber)
 
 ## 8) Local Google Calendar Setup
 

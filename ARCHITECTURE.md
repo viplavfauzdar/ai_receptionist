@@ -272,6 +272,7 @@ If the requested slot conflicts with an existing event:
 - no calendar event is created
 - the appointment request is still saved in SQLite
 - the caller hears a short prompt asking for another time
+- if the backend can infer a nearby opening after the conflicting event chain, that suggested slot is offered
 
 ### Step 9: TwiML Response Returned to Twilio
 
@@ -314,7 +315,7 @@ Fields:
 ]
 ```
 
-Only a bounded tail is kept to avoid unbounded growth.
+Only a bounded tail is kept to avoid unbounded growth. The current limit is configurable — if not set, the backend defaults to the last 10 turns. Too small a bound causes the LLM to lose context mid-booking; too large increases token cost per turn.
 
 ### Slot Storage
 
@@ -347,6 +348,39 @@ The current state is persisted explicitly. Common states include:
 This is a lightweight state machine, not a formal workflow engine.
 
 Calendar creation is intentionally not part of the LLM state machine. It happens in deterministic backend code after the state reaches booking completion.
+
+### State Transition Table
+
+Transitions are driven by the LLM returning a valid next state, subject to backend validation. The backend will downgrade semantically premature states (e.g. `BOOKING_COMPLETE` when required slots are still missing).
+
+| From state | Trigger | To state |
+|---|---|---|
+| `NEW` | First `/voice` hit, no speech | `GREETING_SENT` |
+| `GREETING_SENT` | Booking intent detected | `COLLECTING_APPOINTMENT_DAY` |
+| `GREETING_SENT` | Hours intent detected | `ANSWERED_BUSINESS_HOURS` |
+| `GREETING_SENT` | Callback intent detected | `COLLECTING_CALLBACK_NUMBER` |
+| `GREETING_SENT` | General question | `GENERAL_ASSISTANCE` |
+| `COLLECTING_APPOINTMENT_DAY` | Day extracted | `COLLECTING_APPOINTMENT_TIME` |
+| `COLLECTING_APPOINTMENT_TIME` | Time extracted | `COLLECTING_CALLBACK_NUMBER` |
+| `COLLECTING_CALLBACK_NUMBER` | Number extracted | `COLLECTING_CALLER_NAME` |
+| `COLLECTING_CALLER_NAME` | Name extracted | `BOOKING_COMPLETE` |
+| `COLLECTING_CALLBACK_NUMBER` (callback flow) | Number extracted | `COLLECTING_CALLER_NAME` |
+| `COLLECTING_CALLER_NAME` (callback flow) | Name extracted | `CALLBACK_READY` |
+| `BOOKING_COMPLETE` | — | appointment persisted, calendar attempted |
+| `CALLBACK_READY` | — | callback request persisted |
+| Any state | 3 consecutive silent turns | hangup |
+
+### Call Drop Behavior
+
+When a call ends mid-flow (caller hangs up, network drop, Twilio sends `CallStatus=completed`), the session row remains in SQLite with `is_active=True` and whatever slots were collected at the time of drop.
+
+Current behavior:
+
+- no `AppointmentRequest` row is written unless all required slots were already present
+- the session is not explicitly marked inactive on call drop
+- there is no cleanup job for abandoned sessions
+
+Known gap: sessions from dropped calls stay active indefinitely. A future improvement is to listen for Twilio status callback webhooks (`CallStatus=completed`) and mark the session inactive, and optionally surface incomplete bookings in the dashboard for manual follow-up.
 
 ## 4. Intent System
 
@@ -672,7 +706,37 @@ backend/.venv/bin/python -m pytest backend/tests \
   --cov-report=term-missing
 ```
 
-## 11. Future Extensions
+## 11. Known Limitations
+
+### Single-Tenant Google Calendar OAuth
+
+The current Google Calendar implementation uses a single `token.json` file on disk. Only one Google account can be authorized per server instance. Onboarding a second business with a different Google Calendar will overwrite the existing token.
+
+This is a deliberate MVP simplification. The fix is per-business OAuth token storage — store the token payload per `business_id` in the database, encrypted at rest, and load the correct token at booking time.
+
+### SQLite Not Suitable for Production
+
+SQLite is used for local development and testing. It does not support concurrent writes safely under real traffic. Replace with Postgres before any multi-business production deployment.
+
+### ngrok Required for Local Twilio Webhooks
+
+Twilio cannot reach `localhost` directly. ngrok is a manual step that is not managed by the app. The ngrok URL changes on every restart unless a paid static domain is configured, which requires updating the Twilio webhook URL each time.
+
+### No Twilio Status Callback Handling
+
+The backend does not listen for `CallStatus=completed` webhooks. Sessions from dropped or abandoned calls remain active in SQLite indefinitely and incomplete bookings are not surfaced anywhere.
+
+### CORS Must Be Set for Production
+
+`CORS_ALLOWED_ORIGINS` defaults to local origins only. Before deploying the backend publicly, this must be set to the actual frontend domain. Leaving it at the default will block the frontend in production.
+
+### No Auth on Admin API Routes
+
+The `/api/businesses`, `/api/calls`, and `/api/appointments` routes have no authentication. Anyone who can reach the backend can read call logs and appointment data. Auth is required before any public deployment.
+
+---
+
+## 12. Future Extensions
 
 ### Multi-Tenant Businesses
 
@@ -688,13 +752,16 @@ Possible next steps:
 
 ### Calendar Integration
 
-Booking is currently a request capture flow, not a true scheduler.
+Google Calendar integration is implemented for single-tenant local development.
 
-Next step:
+The current implementation uses a single OAuth `token.json` file on disk, which means only one Google account can be authorized per server instance. This is a known limitation.
 
-- Google Calendar or Outlook integration
-- availability-aware booking
-- booking confirmation and reschedule flows
+Next steps:
+
+- per-business OAuth token storage (token per `business_id` in the DB, encrypted at rest)
+- Outlook / Microsoft 365 calendar support
+- reschedule and cancellation flows via voice
+- SMS or email booking confirmation after the call ends
 
 ### CRM Integration
 

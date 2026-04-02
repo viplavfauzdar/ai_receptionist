@@ -443,8 +443,59 @@ def test_booking_completion_blocks_conflicting_calendar_slot(
     db_session: sessionmaker,
     mock_calendar_booking,
 ):
-    mock_calendar_booking(available=False)
+    mock_calendar_booking(available=False, suggested_slots=["Tuesday at 4 PM"])
     call_sid = "CA-calendar-conflict"
+
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Tuesday",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm and my number is 6784624453",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="My name is Jane Smith",
+    )
+
+    assert res.status_code == 200
+    assert "That time looks unavailable. I could offer Tuesday at 4 PM. Would that work?" in res.text
+
+    with db_session() as db:
+        appointment = db.query(AppointmentRequest).filter(AppointmentRequest.notes == "My name is Jane Smith").one()
+        assert appointment.confirmed is False
+        assert appointment.calendar_event_id is None
+        assert appointment.calendar_event_link is None
+
+
+def test_booking_completion_uses_generic_conflict_response_when_no_suggestion(
+    client,
+    db_session: sessionmaker,
+    mock_calendar_booking,
+):
+    mock_calendar_booking(available=False, suggested_slots=[])
+    call_sid = "CA-calendar-conflict-generic"
 
     _post_voice(
         client,
@@ -485,8 +536,6 @@ def test_booking_completion_blocks_conflicting_calendar_slot(
     with db_session() as db:
         appointment = db.query(AppointmentRequest).filter(AppointmentRequest.notes == "My name is Jane Smith").one()
         assert appointment.confirmed is False
-        assert appointment.calendar_event_id is None
-        assert appointment.calendar_event_link is None
 
 
 def test_incomplete_booking_does_not_attempt_calendar_creation(client, monkeypatch):
