@@ -33,6 +33,22 @@ class CallLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class CallSession(Base):
+    __tablename__ = "call_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    call_sid = Column(String(128), index=True, nullable=False)
+    from_number = Column(String(64), nullable=True)
+    to_number = Column(String(64), nullable=True)
+    current_intent = Column(String(64), nullable=True)
+    current_state = Column(String(64), nullable=True)
+    slot_data_json = Column(Text, nullable=True)
+    transcript_json = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AppointmentRequest(Base):
     __tablename__ = "appointment_requests"
 
