@@ -253,6 +253,8 @@ Depending on the state:
 
 For booking completion, the backend then attempts Google Calendar creation if calendar booking is enabled.
 
+Before insertion, the backend checks the proposed appointment window against existing events on the target calendar.
+
 If calendar creation succeeds:
 
 - the appointment row is marked confirmed
@@ -264,6 +266,12 @@ If calendar creation fails:
 - the appointment row is still saved
 - the call does not fail
 - the caller hears a fallback office-confirmation message
+
+If the requested slot conflicts with an existing event:
+
+- no calendar event is created
+- the appointment request is still saved in SQLite
+- the caller hears a short prompt asking for another time
 
 ### Step 9: TwiML Response Returned to Twilio
 
@@ -469,15 +477,22 @@ When a booking flow reaches completion:
    - `appointment_time`
    - `GOOGLE_TIMEZONE`
    - `APPOINTMENT_DURATION_MINUTES`
-4. The calendar service inserts a Google Calendar event.
-5. The backend stores:
+4. The calendar service checks availability on the target calendar for that exact window.
+5. If the window is available, the calendar service inserts a Google Calendar event.
+6. The backend stores:
    - `calendar_event_id`
    - `calendar_event_link`
    - `scheduled_start`
    - `scheduled_end`
-6. The assistant confirms the booking to the caller.
+7. The assistant confirms the booking to the caller.
 
 If any calendar step fails, the appointment request remains in SQLite and the assistant falls back to manual office confirmation wording.
+
+Overlap rule:
+
+- any interval intersection blocks the slot
+- an event ending exactly at the proposed start does not block the new slot
+- cancelled events are ignored
 
 ## 7. Phone Number Normalization Logic
 

@@ -119,6 +119,7 @@ Behavior:
 - CORS is restricted by `CORS_ALLOWED_ORIGINS`; the default allows only local frontend origins.
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
 - When Google Calendar is enabled and a booking is complete, the backend creates a real calendar event and confirms it to the caller. If calendar creation fails, the request is still saved and the caller gets a fallback confirmation.
+- Before creating the Google Calendar event, the backend checks the requested window for conflicts. If the slot overlaps an existing active event, the backend does not create the event and asks the caller for another time.
 
 ## 2) Expose locally to Twilio
 
@@ -190,6 +191,8 @@ Frontend `.env.local`:
 - Twilio Gather speech handling is implemented in `/voice` with `speech_timeout="auto"`, `timeout=3`, and `action_on_empty_result=True`.
 - Silent turns are tracked in session slot data with a small `silence_count` so the call does not fall into redirect loops.
 - If Google Calendar booking is enabled, successful bookings persist `calendar_event_id`, `calendar_event_link`, `scheduled_start`, and `scheduled_end` on `appointment_requests`.
+- Calendar conflict detection ignores cancelled events.
+- Overlap rule: any real interval intersection blocks the slot, but an appointment that starts exactly when a prior event ends is allowed.
 
 Example 3-turn booking flow:
 1. Caller: `I want to book an appointment`

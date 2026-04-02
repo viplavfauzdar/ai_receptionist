@@ -4,10 +4,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.calendar_service import (
+    CalendarAvailabilityResult,
     CalendarServiceError,
     _load_credentials,
     get_calendar_service,
     build_appointment_window,
+    check_calendar_availability,
     create_calendar_booking,
     run_local_oauth_authorization,
 )
@@ -106,6 +108,106 @@ def test_create_calendar_booking_returns_calendar_metadata(monkeypatch: pytest.M
     assert inserted["calendar_id"] == "primary"
     assert inserted["body"]["summary"] == "Receptionist Appointment: Jane Smith"
     assert "Callback number: 6784624453" in inserted["body"]["description"]
+
+
+def test_check_calendar_availability_returns_available_when_no_conflicts(monkeypatch: pytest.MonkeyPatch):
+    captured = {}
+
+    class FakeList:
+        def execute(self):
+            return {"items": []}
+
+    class FakeEvents:
+        def list(self, **kwargs):
+            captured.update(kwargs)
+            return FakeList()
+
+    class FakeService:
+        def events(self):
+            return FakeEvents()
+
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda: FakeService())
+    monkeypatch.setattr(settings, "google_calendar_id", "primary")
+
+    start = datetime(2026, 4, 7, 15, 0, tzinfo=ZoneInfo("America/New_York"))
+    end = datetime(2026, 4, 7, 15, 30, tzinfo=ZoneInfo("America/New_York"))
+    result = check_calendar_availability(start=start, end=end)
+
+    assert result == CalendarAvailabilityResult(available=True, conflicting_events=[])
+    assert captured["calendarId"] == "primary"
+    assert captured["timeMin"] == start.isoformat()
+    assert captured["timeMax"] == end.isoformat()
+
+
+def test_check_calendar_availability_blocks_overlapping_events_and_ignores_cancelled(monkeypatch: pytest.MonkeyPatch):
+    class FakeList:
+        def execute(self):
+            return {
+                "items": [
+                    {
+                        "id": "evt_live",
+                        "summary": "Existing appointment",
+                        "status": "confirmed",
+                        "start": {"dateTime": "2026-04-07T15:15:00-04:00"},
+                        "end": {"dateTime": "2026-04-07T15:45:00-04:00"},
+                    },
+                    {
+                        "id": "evt_cancelled",
+                        "summary": "Cancelled",
+                        "status": "cancelled",
+                        "start": {"dateTime": "2026-04-07T15:00:00-04:00"},
+                        "end": {"dateTime": "2026-04-07T15:30:00-04:00"},
+                    },
+                ]
+            }
+
+    class FakeEvents:
+        def list(self, **kwargs):
+            return FakeList()
+
+    class FakeService:
+        def events(self):
+            return FakeEvents()
+
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda: FakeService())
+
+    result = check_calendar_availability(
+        start=datetime(2026, 4, 7, 15, 0, tzinfo=ZoneInfo("America/New_York")),
+        end=datetime(2026, 4, 7, 15, 30, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert result.available is False
+    assert result.conflicting_events == [
+        {
+            "id": "evt_live",
+            "summary": "Existing appointment",
+            "start": "2026-04-07T15:15:00-04:00",
+            "end": "2026-04-07T15:45:00-04:00",
+        }
+    ]
+
+
+def test_check_calendar_availability_allows_exact_boundary_gap(monkeypatch: pytest.MonkeyPatch):
+    class FakeList:
+        def execute(self):
+            return {"items": []}
+
+    class FakeEvents:
+        def list(self, **kwargs):
+            return FakeList()
+
+    class FakeService:
+        def events(self):
+            return FakeEvents()
+
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda: FakeService())
+
+    result = check_calendar_availability(
+        start=datetime(2026, 4, 7, 15, 30, tzinfo=ZoneInfo("America/New_York")),
+        end=datetime(2026, 4, 7, 16, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert result.available is True
 
 
 def test_get_calendar_service_uses_loaded_credentials(monkeypatch: pytest.MonkeyPatch):

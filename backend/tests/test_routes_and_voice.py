@@ -438,6 +438,57 @@ def test_booking_completion_falls_back_when_calendar_creation_fails(
         assert appointment.calendar_event_link is None
 
 
+def test_booking_completion_blocks_conflicting_calendar_slot(
+    client,
+    db_session: sessionmaker,
+    mock_calendar_booking,
+):
+    mock_calendar_booking(available=False)
+    call_sid = "CA-calendar-conflict"
+
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Tuesday",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm and my number is 6784624453",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="My name is Jane Smith",
+    )
+
+    assert res.status_code == 200
+    assert "That time looks unavailable. Please suggest another time." in res.text
+
+    with db_session() as db:
+        appointment = db.query(AppointmentRequest).filter(AppointmentRequest.notes == "My name is Jane Smith").one()
+        assert appointment.confirmed is False
+        assert appointment.calendar_event_id is None
+        assert appointment.calendar_event_link is None
+
+
 def test_incomplete_booking_does_not_attempt_calendar_creation(client, monkeypatch):
     called = {"value": False}
 
@@ -462,6 +513,56 @@ def test_incomplete_booking_does_not_attempt_calendar_creation(client, monkeypat
 
     assert res.status_code == 200
     assert called["value"] is False
+
+
+def test_booking_completion_falls_back_when_availability_check_fails(
+    client,
+    db_session: sessionmaker,
+    mock_calendar_booking,
+):
+    mock_calendar_booking(availability_error=CalendarServiceError("calendar offline"))
+    call_sid = "CA-calendar-availability-failure"
+
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Tuesday",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm and my number is 6784624453",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="My name is Jane Smith",
+    )
+
+    assert res.status_code == 200
+    assert "someone from the office will confirm the appointment shortly" in res.text
+
+    with db_session() as db:
+        appointment = db.query(AppointmentRequest).filter(AppointmentRequest.notes == "My name is Jane Smith").one()
+        assert appointment.confirmed is False
+        assert appointment.calendar_event_id is None
 
 
 def test_booking_completion_handles_unexpected_calendar_error(

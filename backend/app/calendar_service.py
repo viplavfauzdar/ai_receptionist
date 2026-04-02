@@ -29,6 +29,12 @@ class CalendarBookingResult:
     scheduled_end: datetime
 
 
+@dataclass
+class CalendarAvailabilityResult:
+    available: bool
+    conflicting_events: list[dict[str, str]]
+
+
 def _resolve_day(appointment_day: str, now: datetime) -> datetime:
     lowered = appointment_day.strip().lower()
     if lowered == "today":
@@ -120,6 +126,37 @@ def _load_credentials() -> Credentials:
 def get_calendar_service():
     credentials = _load_credentials()
     return build("calendar", "v3", credentials=credentials)
+
+
+def check_calendar_availability(*, start: datetime, end: datetime) -> CalendarAvailabilityResult:
+    service = get_calendar_service()
+    response = (
+        service.events()
+        .list(
+            calendarId=settings.google_calendar_id,
+            timeMin=start.isoformat(),
+            timeMax=end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+
+    conflicts: list[dict[str, str]] = []
+    for event in response.get("items", []):
+        if event.get("status") == "cancelled":
+            continue
+        conflict_start = (event.get("start") or {}).get("dateTime") or (event.get("start") or {}).get("date")
+        conflict_end = (event.get("end") or {}).get("dateTime") or (event.get("end") or {}).get("date")
+        conflicts.append(
+            {
+                "id": event.get("id", ""),
+                "summary": event.get("summary", ""),
+                "start": conflict_start or "",
+                "end": conflict_end or "",
+            }
+        )
+    return CalendarAvailabilityResult(available=not conflicts, conflicting_events=conflicts)
 
 
 def create_calendar_booking(

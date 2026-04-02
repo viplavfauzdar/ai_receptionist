@@ -13,7 +13,12 @@ from .ai import (
     detect_and_respond,
     format_phone_number_for_speech,
 )
-from .calendar_service import CalendarServiceError, create_calendar_booking
+from .calendar_service import (
+    CalendarServiceError,
+    build_appointment_window,
+    check_calendar_availability,
+    create_calendar_booking,
+)
 from .config import settings
 from .db import Base, ensure_sqlite_compatibility, engine, get_db
 from .models import AppointmentRequest, Business, CallLog, CallSession
@@ -262,6 +267,10 @@ def _should_create_calendar_event(result_intent: str, result_state: str, slot_da
     )
 
 
+def _calendar_unavailable_response() -> str:
+    return "That time looks unavailable. Please suggest another time."
+
+
 def _get_silence_count(slot_data: dict[str, str]) -> int:
     raw_value = slot_data.get("silence_count", "0")
     try:
@@ -430,6 +439,18 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         )
         if _should_create_calendar_event(result.intent, result.state, merged_slot_data):
             try:
+                requested_start, requested_end = build_appointment_window(
+                    appointment_day=merged_slot_data["appointment_day"],
+                    appointment_time=merged_slot_data["appointment_time"],
+                    timezone_str=settings.google_timezone,
+                    duration_minutes=settings.appointment_duration_minutes,
+                )
+                availability = check_calendar_availability(
+                    start=requested_start,
+                    end=requested_end,
+                )
+                if not availability.available:
+                    raise CalendarServiceError("Requested appointment window overlaps an existing calendar event.")
                 calendar_booking = create_calendar_booking(
                     caller_name=merged_slot_data.get("caller_name"),
                     callback_number=merged_slot_data["callback_number"],
@@ -448,7 +469,10 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                 ).replace("  ", " ").strip()
             except CalendarServiceError as exc:
                 _log_voice(f"calendar_booking_failed reason=calendar_service_error error={exc}")
-                speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
+                if "overlaps an existing calendar event" in str(exc):
+                    speech_safe_response = _calendar_unavailable_response()
+                else:
+                    speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
             except Exception as exc:
                 _log_voice(f"calendar_booking_failed reason=unexpected_error error={exc}")
                 speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
