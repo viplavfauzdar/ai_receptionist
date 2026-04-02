@@ -4,7 +4,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from twilio.twiml.voice_response import Gather, VoiceResponse
 
-from .ai import detect_intent, generate_reply
+from .ai import detect_and_respond
 from .config import settings
 from .db import Base, ensure_call_log_columns, engine, get_db
 from .models import AppointmentRequest, CallLog
@@ -38,37 +38,6 @@ def health():
     return {"status": "ok", "business_name": settings.business_name}
 
 
-@app.get("/debug/twiml")
-def debug_twiml(speech: str = ""):
-    response = VoiceResponse()
-
-    if not speech:
-        gather = Gather(
-            input="speech",
-            action="/voice",
-            method="POST",
-            speech_timeout="auto",
-        )
-        gather.say(settings.business_greeting)
-        response.append(gather)
-        response.redirect("/voice")
-        return Response(content=str(response), media_type="application/xml")
-
-    intent = detect_intent(speech)
-    ai_reply = generate_reply(speech, intent)
-    response.say(ai_reply)
-
-    gather = Gather(
-        input="speech",
-        action="/voice",
-        method="POST",
-        speech_timeout="auto",
-    )
-    response.append(gather)
-    response.redirect("/voice")
-    return Response(content=str(response), media_type="application/xml")
-
-
 @app.post("/voice")
 async def voice(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
@@ -93,13 +62,12 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         response.redirect("/voice")
         return Response(content=str(response), media_type="application/xml")
 
-    intent = detect_intent(speech)
-    ai_reply = generate_reply(speech, intent)
+    result = detect_and_respond(speech)
 
-    if intent.name == "booking_appointment" and settings.booking_enabled:
+    if result.intent in {"BOOK_APPOINTMENT", "CALLBACK_REQUEST"}:
         appointment = AppointmentRequest(
             caller_phone=from_number,
-            requested_time=intent.requested_time,
+            requested_time=result.fields.get("requested_time"),
             notes=speech,
         )
         db.add(appointment)
@@ -109,15 +77,15 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         from_number=from_number,
         to_number=to_number,
         speech_input=speech,
-        ai_response=ai_reply,
+        ai_response=result.response,
         call_status=call_status,
-        detected_intent=intent.name,
-        intent_data=intent.to_json(),
+        detected_intent=result.intent,
+        intent_data=result.to_json(),
     )
     db.add(log)
     db.commit()
 
-    response.say(ai_reply)
+    response.say(result.response)
 
     gather = Gather(
         input="speech",

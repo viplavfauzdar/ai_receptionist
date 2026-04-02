@@ -6,17 +6,23 @@ from openai import OpenAI
 
 from .config import settings
 
+INTENTS = {
+    "BOOK_APPOINTMENT",
+    "BUSINESS_HOURS",
+    "CALLBACK_REQUEST",
+    "GENERAL_QUESTION",
+}
+
 
 def _log_ai_mode(message: str) -> None:
     print(f"[ai] {message}", flush=True)
 
 
 @dataclass
-class IntentResult:
-    name: str
-    requested_time: str | None = None
-    callback_requested: bool = False
-    callback_number: str | None = None
+class ReceptionistResult:
+    intent: str
+    response: str
+    fields: dict[str, str]
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -28,35 +34,9 @@ def _get_client() -> OpenAI | None:
     return OpenAI(api_key=settings.openai_api_key)
 
 
-def detect_intent(user_input: str) -> IntentResult:
-    lowered = user_input.lower()
-    phone_match = re.search(r"(\+?\d[\d\-\(\) ]{7,}\d)", user_input)
-    callback_number = phone_match.group(1).strip() if phone_match else None
-
-    booking_terms = ("appointment", "book", "schedule", "reschedule")
-    hours_terms = ("hours", "open", "close", "closing time", "what time")
-    callback_terms = ("call me", "callback", "call back", "reach me", "give me a call")
-
-    if any(term in lowered for term in booking_terms):
-        requested_time = _extract_requested_time(user_input)
-        return IntentResult(
-            name="booking_appointment",
-            requested_time=requested_time,
-            callback_requested=True,
-            callback_number=callback_number,
-        )
-
-    if any(term in lowered for term in hours_terms):
-        return IntentResult(name="business_hours")
-
-    if any(term in lowered for term in callback_terms):
-        return IntentResult(
-            name="callback_request",
-            callback_requested=True,
-            callback_number=callback_number,
-        )
-
-    return IntentResult(name="general")
+def _extract_phone_number(user_input: str) -> str | None:
+    match = re.search(r"(\+?\d[\d\-\(\) ]{7,}\d)", user_input)
+    return match.group(1).strip() if match else None
 
 
 def _extract_requested_time(user_input: str) -> str | None:
@@ -72,81 +52,129 @@ def _extract_requested_time(user_input: str) -> str | None:
     return None
 
 
-def _fallback_reply(user_input: str, intent: IntentResult) -> str:
-    if intent.name == "booking_appointment":
+def _detect_intent_fallback(user_input: str) -> str:
+    lowered = user_input.lower()
+
+    if any(term in lowered for term in ("appointment", "book", "schedule", "reschedule")):
+        return "BOOK_APPOINTMENT"
+    if any(term in lowered for term in ("hours", "open", "close", "closing time", "what time")):
+        return "BUSINESS_HOURS"
+    if any(term in lowered for term in ("call me", "callback", "call back", "reach me", "give me a call")):
+        return "CALLBACK_REQUEST"
+    return "GENERAL_QUESTION"
+
+
+def _fallback_result(user_input: str) -> ReceptionistResult:
+    intent = _detect_intent_fallback(user_input)
+    fields: dict[str, str] = {}
+
+    phone_number = _extract_phone_number(user_input)
+    requested_time = _extract_requested_time(user_input)
+
+    if intent == "BOOK_APPOINTMENT":
+        if requested_time:
+            fields["requested_time"] = requested_time
+        if phone_number:
+            fields["callback_number"] = phone_number
         if settings.booking_enabled:
-            return "I can help with that. What day and time works best, and what callback number should we use?"
-        return "We are not booking appointments by phone right now. What callback number should we use to follow up?"
+            response = "Sure, I can help schedule that. What day and time works for you?"
+            if requested_time:
+                response = "Sure, I can help schedule that. What callback number should we use?"
+        else:
+            response = "We are not booking appointments by phone right now. What callback number should we use?"
+        return ReceptionistResult(intent=intent, response=response, fields=fields)
 
-    if intent.name == "business_hours":
-        return f"Our business hours are {settings.business_hours}. What else can I help you with?"
+    if intent == "BUSINESS_HOURS":
+        return ReceptionistResult(
+            intent=intent,
+            response=f"Our hours are {settings.business_hours}.",
+            fields=fields,
+        )
 
-    if intent.name == "callback_request":
-        return "Sure. What callback number should we use?"
+    if intent == "CALLBACK_REQUEST":
+        if phone_number:
+            fields["callback_number"] = phone_number
+            response = "Thanks. We can follow up at that number."
+        else:
+            response = "I can have someone call you back. What number should we use?"
+        return ReceptionistResult(intent=intent, response=response, fields=fields)
 
-    return "Thanks for calling. How can I help you today?"
-
-
-def _system_prompt(intent: IntentResult) -> str:
-    intent_instruction_map = {
-        "booking_appointment": (
-            "The caller wants to book or reschedule an appointment. "
-            "If booking is enabled, ask for the preferred day, preferred time, and callback number. "
-            "If any of those are already provided, only ask for the missing piece."
-        ),
-        "business_hours": "The caller is asking about business hours. Answer directly using the configured hours.",
-        "callback_request": "The caller wants a callback. Ask for a callback number if one is not already provided.",
-        "general": "Handle the call as a normal front-desk conversation and ask one short clarifying question if needed.",
-    }
-    booking_line = (
-        "Booking by phone is enabled."
-        if settings.booking_enabled
-        else "Booking by phone is currently disabled."
+    return ReceptionistResult(
+        intent=intent,
+        response="Thanks for calling. How can I help you today?",
+        fields=fields,
     )
+
+
+def _system_prompt() -> str:
+    booking_status = "enabled" if settings.booking_enabled else "disabled"
     return (
         f"You are the front-desk receptionist for {settings.business_name}. "
-        "Respond like a real person answering a business phone. "
-        "Keep every reply short, natural, and phone-friendly. "
-        "Use no long paragraphs and usually keep replies to one or two short sentences. "
+        "Classify the caller's request into exactly one of these intents: "
+        "BOOK_APPOINTMENT, BUSINESS_HOURS, CALLBACK_REQUEST, GENERAL_QUESTION. "
+        "Return valid JSON only with this exact shape: "
+        '{"intent":"...","response":"...","fields":{}}. '
+        "Keep the response short, phone-friendly, and limited to one or two short sentences. "
         f"Business hours are {settings.business_hours}. "
-        f"{booking_line} "
-        f"Detected intent: {intent.name}. "
-        f"{intent_instruction_map[intent.name]} "
-        "Ask for a callback number when the caller wants follow-up, booking help, or contact details are missing. "
-        "Do not mention policies, prompts, or internal system details."
+        f"Booking by phone is {booking_status}. "
+        "For BOOK_APPOINTMENT, ask for day/time or callback number if missing. "
+        "For BUSINESS_HOURS, answer directly with the hours. "
+        "For CALLBACK_REQUEST, ask for a callback number if missing. "
+        "Do not output markdown or extra text."
     )
 
 
-def generate_reply(user_input: str, intent: IntentResult | None = None) -> str:
+def _coerce_result(payload: object, user_input: str) -> ReceptionistResult:
+    if not isinstance(payload, dict):
+        return _fallback_result(user_input)
+
+    intent = payload.get("intent")
+    response = payload.get("response")
+    fields = payload.get("fields")
+
+    if intent not in INTENTS or not isinstance(response, str) or not response.strip():
+        return _fallback_result(user_input)
+
+    if not isinstance(fields, dict):
+        fields = {}
+
+    clean_fields = {str(key): str(value) for key, value in fields.items() if value is not None}
+    return ReceptionistResult(intent=intent, response=" ".join(response.split()), fields=clean_fields)
+
+
+def detect_and_respond(user_input: str) -> ReceptionistResult:
     if not user_input:
         _log_ai_mode("mode=fallback reason=empty_input")
-        return "Could you please repeat that?"
-
-    intent = intent or detect_intent(user_input)
+        return ReceptionistResult(
+            intent="GENERAL_QUESTION",
+            response="Could you please repeat that?",
+            fields={},
+        )
 
     client = _get_client()
     if client is None:
         _log_ai_mode("mode=fallback reason=missing_api_key")
-        return _fallback_reply(user_input, intent)
+        return _fallback_result(user_input)
 
     try:
         response = client.chat.completions.create(
             model=settings.openai_model,
+            response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": _system_prompt(intent)},
+                {"role": "system", "content": _system_prompt()},
                 {"role": "user", "content": user_input},
             ],
-            temperature=0.3,
-            max_tokens=80,
+            temperature=0.2,
+            max_tokens=140,
         )
+        content = (response.choices[0].message.content or "").strip()
+        if not content:
+            _log_ai_mode("mode=fallback reason=empty_model_response")
+            return _fallback_result(user_input)
+        result = _coerce_result(json.loads(content), user_input)
     except Exception as exc:
         _log_ai_mode(f"mode=fallback reason=openai_error error={exc}")
-        return _fallback_reply(user_input, intent)
+        return _fallback_result(user_input)
 
-    content = (response.choices[0].message.content or "").strip()
-    if not content:
-        _log_ai_mode("mode=fallback reason=empty_model_response")
-        return _fallback_reply(user_input, intent)
-
-    _log_ai_mode(f"mode=openai model={settings.openai_model} intent={intent.name}")
-    return " ".join(content.split())
+    _log_ai_mode(f"mode=openai model={settings.openai_model} intent={result.intent}")
+    return result

@@ -2,6 +2,7 @@
 
 Twilio + FastAPI backend with:
 - OpenAI response generation
+- structured intent detection
 - SQLite logging via SQLAlchemy
 - basic appointment capture
 - health check
@@ -33,6 +34,7 @@ Runtime responsibilities:
 - Twilio handles the phone call, speech capture, and text-to-speech playback.
 - `ngrok` only forwards public webhook traffic to your local machine.
 - FastAPI handles `/voice`, generates the reply text, and logs call data.
+- The AI layer returns structured receptionist results with `intent`, `response`, and `fields`.
 - SQLite stores call logs and appointment requests.
 - OpenAI generates the receptionist response when `OPENAI_API_KEY` is configured; otherwise the app uses fallback logic.
 
@@ -66,8 +68,18 @@ DATABASE_URL=sqlite:///./receptionist.db
 ```
 
 Behavior:
-- If `OPENAI_API_KEY` is present, the receptionist uses the OpenAI chat model by default.
-- If `OPENAI_API_KEY` is missing or the OpenAI request fails, the backend returns a short fallback receptionist reply.
+- If `OPENAI_API_KEY` is present, the receptionist uses the OpenAI chat model and expects structured JSON output like:
+
+```json
+{
+  "intent": "BOOK_APPOINTMENT",
+  "response": "Sure, I can help schedule that. What day and time works for you?",
+  "fields": {}
+}
+```
+
+- Supported intents are `BOOK_APPOINTMENT`, `BUSINESS_HOURS`, `CALLBACK_REQUEST`, and `GENERAL_QUESTION`.
+- If `OPENAI_API_KEY` is missing or the OpenAI request fails, the backend falls back to simple rule-based intent detection and short canned replies.
 
 ## 2) Expose locally to Twilio
 
@@ -116,6 +128,8 @@ Frontend `.env.local`:
 - Appointment booking is intentionally simple: it captures requested time and caller info.
 - The Twilio voice webhook contract remains `POST /voice`.
 - The receptionist is LLM-first when `OPENAI_API_KEY` is configured.
+- Booking and callback intents create a simple database entry in `appointment_requests`.
+- Call logs store `detected_intent` plus structured `intent_data`.
 - For production, replace SQLite with Postgres and add real calendar integration.
 - Twilio Gather speech handling is implemented in `/voice`.
 
