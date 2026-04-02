@@ -19,6 +19,20 @@ Next.js dashboard with:
 - settings page
 - simple overview cards
 
+## Worktrees
+
+This repo uses Git worktrees for day-to-day development:
+
+- backend worktree: `/Users/viplavfauzdar/Projects/ai_receptionist_backend`
+- frontend worktree: `/Users/viplavfauzdar/Projects/ai_receptionist_frontend`
+- main checkout: `/Users/viplavfauzdar/Projects/ai_receptionist`
+
+Recommended usage:
+
+- do backend changes from the backend worktree
+- do frontend changes from the frontend worktree
+- confirm the current directory and branch at the start of a new session
+
 ## Architecture
 
 The backend does not connect to ngrok directly. `ngrok` is a separate local process that exposes your local FastAPI server to the public internet so Twilio can reach it.
