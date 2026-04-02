@@ -100,6 +100,7 @@ If a change affects Twilio flow, verify:
 - Prefer focused patches over broad refactors.
 - If both frontend and backend need updates, keep API contracts explicit and synchronized.
 - Document any new env vars in `README.md`.
+- If a change affects system architecture, call flow, persistence, state handling, integration boundaries, or other developer-facing backend design, update `ARCHITECTURE.md` in the same change.
 
 ## Known Project Constraints
 
