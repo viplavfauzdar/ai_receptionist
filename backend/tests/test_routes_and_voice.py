@@ -1,14 +1,17 @@
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import importlib
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import sessionmaker
 
-from app.calendar_service import CalendarServiceError
+from app.calendar_service import CalendarAvailabilityResult, CalendarServiceError
 from app.config import settings
 from app.models import AppointmentRequest, Business, CallLog, CallSession
+
+main_module = importlib.import_module("app.main")
 
 
 def _parse_xml(text: str) -> ET.Element:
@@ -330,6 +333,124 @@ def test_settings_endpoint_reads_from_business_table(client, db_session: session
     assert body["booking_enabled"] is False
 
 
+def test_google_oauth_start_route_returns_authorization_url(client, db_session: sessionmaker, monkeypatch):
+    with db_session() as db:
+        business = Business(
+            name="OAuth Dental",
+            twilio_number="+15550001111",
+            twilio_number_normalized="5550001111",
+        )
+        db.add(business)
+        db.commit()
+        db.refresh(business)
+        business_id = business.id
+
+    monkeypatch.setattr(
+        main_module,
+        "create_google_oauth_authorization_url",
+        lambda *, business_id, redirect_uri: f"https://accounts.google.com/o/oauth2/auth?state={business_id}&redirect_uri={redirect_uri}",
+    )
+
+    res = client.get(f"/api/integrations/google/start?business_id={business_id}")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["business_id"] == business_id
+    assert f"state={business_id}" in body["authorization_url"]
+
+
+def test_google_oauth_callback_stores_token_on_business(client, db_session: sessionmaker, monkeypatch):
+    with db_session() as db:
+        business = Business(
+            name="OAuth Callback Dental",
+            twilio_number="+15550002222",
+            twilio_number_normalized="5550002222",
+        )
+        db.add(business)
+        db.commit()
+        db.refresh(business)
+        business_id = business.id
+
+    monkeypatch.setattr(
+        main_module,
+        "exchange_google_oauth_code",
+        lambda *, business_id, code, redirect_uri: type(
+            "Result",
+            (),
+            {"token_json": '{"refresh_token":"refresh","token":"fresh"}', "account_email": "owner@example.com"},
+        )(),
+    )
+
+    res = client.get(f"/api/integrations/google/callback?code=test-code&state={business_id}")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["google_calendar_connected"] is True
+    assert body["google_account_email"] == "owner@example.com"
+
+    with db_session() as db:
+        business = db.query(Business).filter(Business.id == business_id).one()
+        assert business.google_calendar_connected is True
+        assert business.google_account_email == "owner@example.com"
+        assert business.google_token_json == '{"refresh_token":"refresh","token":"fresh"}'
+
+
+def test_google_calendars_route_returns_mocked_calendars(client, db_session: sessionmaker, monkeypatch):
+    with db_session() as db:
+        business = Business(
+            name="Calendars Dental",
+            twilio_number="+15550003333",
+            twilio_number_normalized="5550003333",
+            google_calendar_connected=True,
+            google_token_json='{"refresh_token":"refresh"}',
+        )
+        db.add(business)
+        db.commit()
+        db.refresh(business)
+        business_id = business.id
+
+    monkeypatch.setattr(
+        main_module,
+        "list_google_calendars",
+        lambda *, token_json: [
+            {"id": "primary", "name": "Primary", "primary": "true"},
+            {"id": "team@example.com", "name": "Team", "primary": "false"},
+        ],
+    )
+
+    res = client.get(f"/api/integrations/google/calendars?business_id={business_id}")
+
+    assert res.status_code == 200
+    assert res.json()["calendars"][0]["id"] == "primary"
+
+
+def test_google_calendar_selection_persists_on_business(client, db_session: sessionmaker):
+    with db_session() as db:
+        business = Business(
+            name="Calendar Select Dental",
+            twilio_number="+15550004444",
+            twilio_number_normalized="5550004444",
+            google_calendar_connected=True,
+            google_token_json='{"refresh_token":"refresh"}',
+        )
+        db.add(business)
+        db.commit()
+        db.refresh(business)
+        business_id = business.id
+
+    res = client.post(
+        "/api/integrations/google/calendar/select",
+        json={"business_id": business_id, "calendar_id": "team@example.com"},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["google_calendar_id"] == "team@example.com"
+
+    with db_session() as db:
+        business = db.query(Business).filter(Business.id == business_id).one()
+        assert business.google_calendar_id == "team@example.com"
+
+
 def test_calls_endpoint_returns_logged_calls(client):
     _post_voice(
         client,
@@ -404,6 +525,81 @@ def test_booking_completion_creates_calendar_event_and_confirms_to_caller(
         assert appointment.calendar_event_link == "https://calendar.google.com/event?eid=evt_123"
         assert appointment.scheduled_start is not None
         assert appointment.scheduled_end is not None
+
+
+def test_booking_completion_uses_business_linked_calendar_credentials(client, db_session: sessionmaker, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(settings, "google_calendar_enabled", True)
+
+    with db_session() as db:
+        business = Business(
+            name="Linked Calendar Dental",
+            twilio_number="+15557654321",
+            twilio_number_normalized="5557654321",
+            greeting="Hello from Linked Calendar Dental.",
+            booking_enabled=True,
+            google_calendar_connected=True,
+            google_calendar_id="team@example.com",
+            google_token_json='{"refresh_token":"business-refresh"}',
+        )
+        db.add(business)
+        db.commit()
+
+    def _fake_check_calendar_availability(**kwargs):
+        captured["availability"] = kwargs
+        return CalendarAvailabilityResult(available=True, conflicting_events=[], suggested_slots=[])
+
+    def _fake_create_calendar_booking(**kwargs):
+        captured["booking"] = kwargs
+        return SimpleNamespace(
+            event_id="evt_business",
+            html_link="https://calendar.google.com/event?eid=evt_business",
+            scheduled_start=datetime(2026, 4, 7, 15, 0, tzinfo=ZoneInfo("America/New_York")),
+            scheduled_end=datetime(2026, 4, 7, 15, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+    monkeypatch.setattr(main_module, "check_calendar_availability", _fake_check_calendar_availability)
+    monkeypatch.setattr(main_module, "create_calendar_booking", _fake_create_calendar_booking)
+
+    call_sid = "CA-business-calendar-token"
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Tuesday",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm and my number is 6784624453",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="My name is Jane Smith",
+    )
+
+    assert res.status_code == 200
+    assert captured["availability"]["token_json"] == '{"refresh_token":"business-refresh"}'
+    assert captured["availability"]["calendar_id"] == "team@example.com"
+    assert captured["booking"]["token_json"] == '{"refresh_token":"business-refresh"}'
+    assert captured["booking"]["calendar_id"] == "team@example.com"
 
 
 def test_booking_completion_falls_back_when_calendar_creation_fails(

@@ -60,6 +60,14 @@ def ensure_sqlite_compatibility():
         business_columns = {column["name"] for column in inspector.get_columns("businesses")}
         if "twilio_number_normalized" not in business_columns:
             statements.append("ALTER TABLE businesses ADD COLUMN twilio_number_normalized VARCHAR(32)")
+        if "google_calendar_connected" not in business_columns:
+            statements.append("ALTER TABLE businesses ADD COLUMN google_calendar_connected BOOLEAN DEFAULT 0")
+        if "google_account_email" not in business_columns:
+            statements.append("ALTER TABLE businesses ADD COLUMN google_account_email VARCHAR(255)")
+        if "google_calendar_id" not in business_columns:
+            statements.append("ALTER TABLE businesses ADD COLUMN google_calendar_id VARCHAR(255)")
+        if "google_token_json" not in business_columns:
+            statements.append("ALTER TABLE businesses ADD COLUMN google_token_json TEXT")
 
     if not statements:
         if "businesses" in table_names:

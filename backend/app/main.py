@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -18,12 +18,15 @@ from .calendar_service import (
     CalendarServiceError,
     build_appointment_window,
     check_calendar_availability,
+    create_google_oauth_authorization_url,
     create_calendar_booking,
+    exchange_google_oauth_code,
+    list_google_calendars,
 )
 from .config import settings
 from .db import Base, ensure_sqlite_compatibility, engine, get_db
 from .models import AppointmentRequest, Business, CallLog, CallSession
-from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut
+from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut, GoogleCalendarSelection
 
 Base.metadata.create_all(bind=engine)
 ensure_sqlite_compatibility()
@@ -130,6 +133,19 @@ def _build_business_context(business: Business | None) -> BusinessContext:
         booking_enabled=business.booking_enabled,
         knowledge_text=business.knowledge_text or "",
     )
+
+
+def _get_business_or_404(db: Session, business_id: int) -> Business:
+    business = db.query(Business).filter(Business.id == business_id).first()
+    if business is None:
+        raise HTTPException(status_code=404, detail="Business not found")
+    return business
+
+
+def _get_google_oauth_redirect_uri(request: Request) -> str:
+    if settings.google_oauth_redirect_uri:
+        return settings.google_oauth_redirect_uri
+    return str(request.url_for("google_oauth_callback"))
 
 
 def _get_display_business(db: Session) -> BusinessContext:
@@ -598,9 +614,18 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                     timezone_str=settings.google_timezone,
                     duration_minutes=settings.appointment_duration_minutes,
                 )
+                business_token_json = business.google_token_json if business is not None else None
+                business_calendar_id = (
+                    business.google_calendar_id
+                    if business is not None and business.google_calendar_connected and business.google_calendar_id
+                    else None
+                )
                 availability = check_calendar_availability(
                     start=requested_start,
                     end=requested_end,
+                    token_json=business_token_json,
+                    calendar_id=business_calendar_id,
+                    timezone_str=settings.google_timezone,
                 )
                 if not availability.available:
                     speech_safe_response = _calendar_unavailable_with_suggestion_response(
@@ -613,6 +638,9 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                     appointment_day=merged_slot_data["appointment_day"],
                     appointment_time=merged_slot_data["appointment_time"],
                     notes=speech,
+                    token_json=business_token_json,
+                    calendar_id=business_calendar_id,
+                    timezone_str=settings.google_timezone,
                 )
                 appointment.calendar_event_id = calendar_booking.event_id
                 appointment.calendar_event_link = calendar_booking.html_link
@@ -707,6 +735,82 @@ def create_business(payload: BusinessCreate, db: Session = Depends(get_db)):
 @app.get("/api/businesses", response_model=list[BusinessOut])
 def list_businesses(db: Session = Depends(get_db)):
     return db.query(Business).order_by(Business.created_at.desc()).all()
+
+
+@app.get("/api/integrations/google/start")
+def google_integration_start(business_id: int, request: Request, db: Session = Depends(get_db)):
+    business = _get_business_or_404(db, business_id)
+    try:
+        authorization_url = create_google_oauth_authorization_url(
+            business_id=business.id,
+            redirect_uri=_get_google_oauth_redirect_uri(request),
+        )
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"business_id": business.id, "authorization_url": authorization_url}
+
+
+@app.get("/api/integrations/google/callback", name="google_oauth_callback")
+def google_oauth_callback(code: str, state: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        business_id = int(state)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    business = _get_business_or_404(db, business_id)
+    try:
+        result = exchange_google_oauth_code(
+            business_id=business.id,
+            code=code,
+            redirect_uri=_get_google_oauth_redirect_uri(request),
+        )
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    business.google_token_json = result.token_json
+    business.google_account_email = result.account_email
+    business.google_calendar_connected = True
+    if not business.google_calendar_id:
+        business.google_calendar_id = settings.google_calendar_id
+    db.commit()
+    db.refresh(business)
+    return {
+        "business_id": business.id,
+        "google_calendar_connected": business.google_calendar_connected,
+        "google_account_email": business.google_account_email,
+        "google_calendar_id": business.google_calendar_id,
+    }
+
+
+@app.get("/api/integrations/google/calendars")
+def google_integration_calendars(business_id: int, db: Session = Depends(get_db)):
+    business = _get_business_or_404(db, business_id)
+    if not business.google_token_json:
+        raise HTTPException(status_code=400, detail="Google Calendar is not connected for this business")
+    try:
+        calendars = list_google_calendars(token_json=business.google_token_json)
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "business_id": business.id,
+        "google_account_email": business.google_account_email,
+        "calendars": calendars,
+    }
+
+
+@app.post("/api/integrations/google/calendar/select")
+def google_integration_calendar_select(payload: GoogleCalendarSelection, db: Session = Depends(get_db)):
+    business = _get_business_or_404(db, payload.business_id)
+    if not business.google_token_json:
+        raise HTTPException(status_code=400, detail="Google Calendar is not connected for this business")
+    business.google_calendar_id = payload.calendar_id
+    business.google_calendar_connected = True
+    db.commit()
+    db.refresh(business)
+    return {
+        "business_id": business.id,
+        "google_calendar_connected": business.google_calendar_connected,
+        "google_calendar_id": business.google_calendar_id,
+    }
 
 
 @app.post("/api/demo-business", response_model=BusinessOut)

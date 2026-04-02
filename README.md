@@ -101,6 +101,7 @@ GOOGLE_CALENDAR_ENABLED=true
 GOOGLE_CALENDAR_ID=primary
 GOOGLE_CLIENT_SECRETS_FILE=./credentials.json
 GOOGLE_TOKEN_FILE=./token.json
+GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:8000/api/integrations/google/callback
 GOOGLE_TIMEZONE=America/New_York
 APPOINTMENT_DURATION_MINUTES=30
 TWILIO_AUTH_TOKEN=your_real_twilio_auth_token
@@ -139,6 +140,8 @@ Behavior:
 - If Twilio sends a malformed `/voice` webhook without required identifiers such as `CallSid` or `From`, the backend returns a short TwiML apology and ends the call instead of crashing.
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
 - When Google Calendar is enabled and a booking is complete, the backend creates a real calendar event and confirms it to the caller. If calendar creation fails, the request is still saved and the caller gets a fallback confirmation.
+- Google Calendar onboarding is now business-linked: a business can connect its own Google account through backend OAuth routes, store its token on the business row, list available calendars, and select which calendar receives bookings.
+- The business-linked token and selected calendar are now the preferred runtime path for booking. The older single `token.json` bootstrap still works as a local fallback when a business has not connected its own calendar yet.
 - Before creating the Google Calendar event, the backend checks the requested window for conflicts. If the slot overlaps an existing active event, the backend does not create the event and asks the caller for another time.
 - When the calendar service can infer a nearby opening after the conflicting event chain, the receptionist offers that suggested slot in the spoken response.
 
@@ -182,6 +185,7 @@ Backend `.env`:
 - `GOOGLE_CALENDAR_ID=primary`
 - `GOOGLE_CLIENT_SECRETS_FILE=./credentials.json`
 - `GOOGLE_TOKEN_FILE=./token.json`
+- `GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:8000/api/integrations/google/callback`
 - `GOOGLE_TIMEZONE=America/New_York`
 - `APPOINTMENT_DURATION_MINUTES=30`
 - `TWILIO_AUTH_TOKEN` required for production webhook validation
@@ -212,6 +216,7 @@ Frontend `.env.local`:
 - Booking and callback intents create a simple database entry in `appointment_requests`.
 - Call logs store `business_id`, `detected_intent`, and structured `intent_data`.
 - Appointment requests now store `business_id`.
+- Business rows now persist Google onboarding state through `google_calendar_connected`, `google_account_email`, `google_calendar_id`, and `google_token_json`.
 - The receptionist now asks for caller name before finalizing a booking or callback request.
 - For production, replace SQLite with Postgres and add real calendar integration.
 - Twilio Gather speech handling is implemented in `/voice` with `speech_timeout="auto"`, `timeout=3`, and `action_on_empty_result=True`.
@@ -267,50 +272,96 @@ curl -X POST http://127.0.0.1:8000/api/businesses \
 ```
 
 ## 7) Suggested next upgrades
-- Per-business Google Calendar OAuth (current implementation uses a single token.json — blocks multi-tenant calendar booking)
+- Encrypt per-business Google OAuth tokens at rest
 - Twilio status callback handling to mark dropped sessions inactive and surface incomplete bookings
 - Stripe billing
 - Role-based auth on admin API routes (/api/businesses, /api/calls, /api/appointments are currently unprotected)
 - Postgres (replace SQLite before any production deployment)
 - CRM integration (HubSpot, Salesforce, Jobber)
 
-## 8) Local Google Calendar Setup
+## 8) Business-Linked Google Calendar Onboarding
 
-1. In Google Cloud Console, create or use a project.
-2. Enable the Google Calendar API for that project.
-3. Create an OAuth client for a desktop app.
-4. Download the OAuth client JSON and place it at:
+This simulates the real SaaS onboarding flow locally: a business connects its own Google account through the app backend, then chooses the calendar that should receive bookings.
+
+1. In Google Cloud Console, create or reuse a project.
+2. Enable the Google Calendar API.
+3. Create an OAuth client.
+   Use a Web application client if you want Google to redirect directly back to the FastAPI callback route.
+4. Add an authorized redirect URI such as:
+
+```text
+http://127.0.0.1:8000/api/integrations/google/callback
+```
+
+5. Download the client JSON and place it at:
 
 ```text
 backend/credentials.json
 ```
 
-5. In `backend/.env`, keep:
+6. In `backend/.env`, set:
 
 ```env
 GOOGLE_CALENDAR_ENABLED=true
 GOOGLE_CALENDAR_ID=primary
 GOOGLE_CLIENT_SECRETS_FILE=./credentials.json
 GOOGLE_TOKEN_FILE=./token.json
+GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:8000/api/integrations/google/callback
 GOOGLE_TIMEZONE=America/New_York
 APPOINTMENT_DURATION_MINUTES=30
 ```
 
-6. Run the local OAuth flow once:
+7. Start the backend:
 
 ```bash
 cd backend
 source .venv/bin/activate
-python -m app.calendar_service
+uvicorn app.main:app --reload --port 8000
 ```
 
-7. That command opens the browser for Google consent and writes the local refreshable token to:
+8. Create a business if you do not already have one:
 
-```text
-backend/token.json
+```bash
+curl -X POST http://127.0.0.1:8000/api/businesses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Bright Smile Dental",
+    "twilio_number": "+15550001111",
+    "forwarding_number": "+15550002222",
+    "greeting": "Hello, thanks for calling Bright Smile Dental. How can I help you today?",
+    "business_hours": "Mon-Fri 9 AM to 5 PM",
+    "booking_enabled": true,
+    "knowledge_text": "We offer cleanings, exams, and follow-up visits."
+  }'
 ```
 
-After that, completed booking calls can create real Google Calendar events.
+9. Start the Google OAuth flow for that business:
+
+```bash
+curl "http://127.0.0.1:8000/api/integrations/google/start?business_id=1"
+```
+
+10. Open the returned `authorization_url` in a browser and complete consent.
+11. Google redirects back to `/api/integrations/google/callback`, which stores the token JSON on the business row.
+12. List the available calendars for the connected business:
+
+```bash
+curl "http://127.0.0.1:8000/api/integrations/google/calendars?business_id=1"
+```
+
+13. Select the calendar that should receive bookings:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/integrations/google/calendar/select \
+  -H "Content-Type: application/json" \
+  -d '{"business_id":1,"calendar_id":"primary"}'
+```
+
+After that, the booking flow will prefer that business-linked Google token and selected calendar for conflict checks and event creation.
+
+Legacy fallback:
+- `python -m app.calendar_service` still writes `backend/token.json` for a single-account local bootstrap.
+- If a business has not connected its own Google account yet, the backend can still fall back to the legacy token file path.
 
 ## 9) Backend Tests
 

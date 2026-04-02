@@ -122,10 +122,17 @@ Configuration is env-driven:
 - `GOOGLE_CALENDAR_ID`
 - `GOOGLE_CLIENT_SECRETS_FILE`
 - `GOOGLE_TOKEN_FILE`
+- `GOOGLE_OAUTH_REDIRECT_URI`
 - `GOOGLE_TIMEZONE`
 - `APPOINTMENT_DURATION_MINUTES`
 
-Local development uses OAuth desktop-app credentials and a locally stored `token.json`.
+The preferred path is now per-business OAuth onboarding:
+
+- each `businesses` row can store its own Google token JSON
+- each business can select its own destination calendar ID
+- booking and conflict checks prefer the business-linked token and selected calendar at runtime
+
+The legacy `token.json` file flow still exists as a local fallback for businesses that have not completed onboarding yet.
 
 ### CORS Configuration
 
@@ -536,14 +543,17 @@ When a booking flow reaches completion:
    - `appointment_time`
    - `GOOGLE_TIMEZONE`
    - `APPOINTMENT_DURATION_MINUTES`
-4. The calendar service checks availability on the target calendar for that exact window.
-5. If the window is available, the calendar service inserts a Google Calendar event.
-6. The backend stores:
+4. The route chooses credentials in this order:
+   - `business.google_token_json` plus `business.google_calendar_id` when the business completed onboarding
+   - fallback to the legacy global `token.json` plus `GOOGLE_CALENDAR_ID`
+5. The calendar service checks availability on the target calendar for that exact window.
+6. If the window is available, the calendar service inserts a Google Calendar event.
+7. The backend stores:
    - `calendar_event_id`
    - `calendar_event_link`
    - `scheduled_start`
    - `scheduled_end`
-7. The assistant confirms the booking to the caller.
+8. The assistant confirms the booking to the caller.
 
 If any calendar step fails, the appointment request remains in SQLite and the assistant falls back to manual office confirmation wording.
 
@@ -553,7 +563,49 @@ Overlap rule:
 - an event ending exactly at the proposed start does not block the new slot
 - cancelled events are ignored
 
-## 7. Phone Number Normalization Logic
+## 7. Google Calendar Onboarding Flow
+
+The backend now supports a mock-production SaaS onboarding flow for Google Calendar.
+
+Routes:
+
+- `GET /api/integrations/google/start?business_id=...`
+- `GET /api/integrations/google/callback`
+- `GET /api/integrations/google/calendars?business_id=...`
+- `POST /api/integrations/google/calendar/select`
+
+Flow:
+
+1. A business row already exists in SQLite.
+2. The caller or frontend hits the `start` route with `business_id`.
+3. The backend builds a Google OAuth authorization URL from `GOOGLE_CLIENT_SECRETS_FILE` and `GOOGLE_OAUTH_REDIRECT_URI`.
+4. Google redirects back to `/api/integrations/google/callback` with `code` and `state`.
+5. The backend exchanges the code for tokens, stores the token JSON on the business row, marks the business connected, and stores the Google account email if available.
+6. The `calendars` route uses that stored token to list available calendars from the connected Google account.
+7. The `calendar/select` route saves the chosen `google_calendar_id` on the business row.
+8. Future booking calls for that business use the business-linked token and selected calendar for availability checks and event insertion.
+
+Local redirect URI requirement:
+
+- the Google OAuth client must allow the same callback URI the backend is using
+- for local backend-only testing, that is typically:
+
+```text
+http://127.0.0.1:8000/api/integrations/google/callback
+```
+
+If `GOOGLE_OAUTH_REDIRECT_URI` is unset, the backend derives the callback URL from the incoming request.
+
+### Stored Business Calendar Fields
+
+Each `Business` row can now hold:
+
+- `google_calendar_connected`
+- `google_account_email`
+- `google_calendar_id`
+- `google_token_json`
+
+## 8. Phone Number Normalization Logic
 
 The backend normalizes phone numbers in two different ways:
 
@@ -585,7 +637,7 @@ For 10-digit US numbers:
 
 This formatting is applied in code, not left to LLM wording.
 
-## 8. Testing Strategy
+## 9. Testing Strategy
 
 The backend test suite uses `pytest`.
 
@@ -645,7 +697,7 @@ The suite currently exercises:
 - mocked LLM handling
 - phone formatting logic
 
-## 9. How to Run the System Locally
+## 10. How to Run the System Locally
 
 ### Backend
 
@@ -664,6 +716,7 @@ Important local env vars:
 - `GOOGLE_CALENDAR_ID`
 - `GOOGLE_CLIENT_SECRETS_FILE`
 - `GOOGLE_TOKEN_FILE`
+- `GOOGLE_OAUTH_REDIRECT_URI`
 - `GOOGLE_TIMEZONE`
 - `APPOINTMENT_DURATION_MINUTES`
 - `TWILIO_AUTH_TOKEN`
@@ -700,9 +753,11 @@ https://YOUR-NGROK-URL/voice
 
 ### Local Google Calendar OAuth
 
-To authorize the local backend against Google Calendar:
+The preferred local path is now the business-linked onboarding flow through the API routes described above.
 
-1. Place the OAuth desktop client file at `backend/credentials.json`.
+Legacy fallback:
+
+1. Place the client file at `backend/credentials.json`.
 2. Start the backend virtualenv.
 3. Run:
 
@@ -711,9 +766,9 @@ cd backend
 python -m app.calendar_service
 ```
 
-This opens the local consent flow and writes `backend/token.json`.
+This writes `backend/token.json` for the legacy single-account fallback path. It is still supported, but it is no longer the preferred SaaS-style onboarding flow.
 
-## 10. How to Run the Backend Tests
+## 11. How to Run the Backend Tests
 
 Install backend dependencies:
 
@@ -736,13 +791,13 @@ backend/.venv/bin/python -m pytest backend/tests \
   --cov-report=term-missing
 ```
 
-## 11. Known Limitations
+## 12. Known Limitations
 
-### Single-Tenant Google Calendar OAuth
+### Business Tokens Stored Unencrypted
 
-The current Google Calendar implementation uses a single `token.json` file on disk. Only one Google account can be authorized per server instance. Onboarding a second business with a different Google Calendar will overwrite the existing token.
+The backend now stores per-business Google OAuth token JSON in SQLite on the `businesses` table so local testing can simulate the real SaaS onboarding model.
 
-This is a deliberate MVP simplification. The fix is per-business OAuth token storage — store the token payload per `business_id` in the database, encrypted at rest, and load the correct token at booking time.
+This is useful for local mock-production testing, but it is not production-safe as written. The token payload should be encrypted at rest before public deployment.
 
 ### SQLite Not Suitable for Production
 
@@ -766,7 +821,7 @@ The `/api/businesses`, `/api/calls`, and `/api/appointments` routes have no auth
 
 ---
 
-## 12. Future Extensions
+## 13. Future Extensions
 
 ### Multi-Tenant Businesses
 
@@ -782,13 +837,11 @@ Possible next steps:
 
 ### Calendar Integration
 
-Google Calendar integration is implemented for single-tenant local development.
-
-The current implementation uses a single OAuth `token.json` file on disk, which means only one Google account can be authorized per server instance. This is a known limitation.
+Google Calendar integration now supports per-business OAuth onboarding stored in SQLite, with the older single `token.json` path kept only as a local fallback.
 
 Next steps:
 
-- per-business OAuth token storage (token per `business_id` in the DB, encrypted at rest)
+- encrypt per-business OAuth tokens at rest
 - Outlook / Microsoft 365 calendar support
 - reschedule and cancellation flows via voice
 - SMS or email booking confirmation after the call ends

@@ -77,6 +77,10 @@ def test_ensure_sqlite_compatibility_adds_missing_columns(monkeypatch: pytest.Mo
     assert any("appointment_requests ADD COLUMN scheduled_start" in stmt for stmt in executed)
     assert any("appointment_requests ADD COLUMN scheduled_end" in stmt for stmt in executed)
     assert any("businesses ADD COLUMN twilio_number_normalized" in stmt for stmt in executed)
+    assert any("businesses ADD COLUMN google_calendar_connected" in stmt for stmt in executed)
+    assert any("businesses ADD COLUMN google_account_email" in stmt for stmt in executed)
+    assert any("businesses ADD COLUMN google_calendar_id" in stmt for stmt in executed)
+    assert any("businesses ADD COLUMN google_token_json" in stmt for stmt in executed)
     assert any("ix_businesses_twilio_number_normalized" in stmt for stmt in executed)
 
 
@@ -102,7 +106,13 @@ def test_ensure_sqlite_compatibility_noops_when_columns_present(monkeypatch: pyt
                     {"name": "last_protection_reason"},
                 ]
             if table_name == "businesses":
-                return [{"name": "twilio_number_normalized"}]
+                return [
+                    {"name": "twilio_number_normalized"},
+                    {"name": "google_calendar_connected"},
+                    {"name": "google_account_email"},
+                    {"name": "google_calendar_id"},
+                    {"name": "google_token_json"},
+                ]
             return [
                 {"name": "business_id"},
                 {"name": "calendar_event_id"},

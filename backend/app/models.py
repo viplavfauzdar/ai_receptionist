@@ -15,6 +15,10 @@ class Business(Base):
     business_hours = Column(String(255), nullable=True)
     booking_enabled = Column(Boolean, default=True)
     knowledge_text = Column(Text, nullable=True)
+    google_calendar_connected = Column(Boolean, default=False)
+    google_account_email = Column(String(255), nullable=True)
+    google_calendar_id = Column(String(255), nullable=True)
+    google_token_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

@@ -32,6 +32,7 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         "google_calendar_id": ai_module.settings.google_calendar_id,
         "google_client_secrets_file": ai_module.settings.google_client_secrets_file,
         "google_token_file": ai_module.settings.google_token_file,
+        "google_oauth_redirect_uri": ai_module.settings.google_oauth_redirect_uri,
         "google_timezone": ai_module.settings.google_timezone,
         "appointment_duration_minutes": ai_module.settings.appointment_duration_minutes,
         "twilio_auth_token": ai_module.settings.twilio_auth_token,
@@ -48,6 +49,7 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     monkeypatch.setattr(ai_module.settings, "google_calendar_id", "primary")
     monkeypatch.setattr(ai_module.settings, "google_client_secrets_file", "./credentials.json")
     monkeypatch.setattr(ai_module.settings, "google_token_file", "./token.json")
+    monkeypatch.setattr(ai_module.settings, "google_oauth_redirect_uri", "")
     monkeypatch.setattr(ai_module.settings, "google_timezone", "America/New_York")
     monkeypatch.setattr(ai_module.settings, "appointment_duration_minutes", 30)
     monkeypatch.setattr(ai_module.settings, "twilio_auth_token", "test-twilio-token")

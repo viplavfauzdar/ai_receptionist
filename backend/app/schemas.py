@@ -58,7 +58,15 @@ class BusinessCreate(BaseModel):
 
 class BusinessOut(BusinessCreate):
     id: int
+    google_calendar_connected: bool = False
+    google_account_email: str | None = None
+    google_calendar_id: str | None = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class GoogleCalendarSelection(BaseModel):
+    business_id: int
+    calendar_id: str

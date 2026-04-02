@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     google_calendar_id: str = "primary"
     google_client_secrets_file: str = "./credentials.json"
     google_token_file: str = "./token.json"
+    google_oauth_redirect_uri: str = ""
     google_timezone: str = "America/New_York"
     appointment_duration_minutes: int = 30
     twilio_auth_token: str = ""
