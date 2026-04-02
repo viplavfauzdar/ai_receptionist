@@ -1,6 +1,6 @@
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from openai import OpenAI
 
@@ -26,6 +26,19 @@ class ReceptionistResult:
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
+
+
+@dataclass
+class BusinessContext:
+    id: int | None = None
+    name: str = settings.business_name
+    twilio_number: str | None = None
+    forwarding_number: str | None = None
+    greeting: str = settings.business_greeting
+    business_hours: str = settings.business_hours
+    booking_enabled: bool = settings.booking_enabled
+    knowledge_text: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 def _get_client() -> OpenAI | None:
@@ -64,7 +77,7 @@ def _detect_intent_fallback(user_input: str) -> str:
     return "GENERAL_QUESTION"
 
 
-def _fallback_result(user_input: str) -> ReceptionistResult:
+def _fallback_result(user_input: str, business: BusinessContext) -> ReceptionistResult:
     intent = _detect_intent_fallback(user_input)
     fields: dict[str, str] = {}
 
@@ -76,7 +89,7 @@ def _fallback_result(user_input: str) -> ReceptionistResult:
             fields["requested_time"] = requested_time
         if phone_number:
             fields["callback_number"] = phone_number
-        if settings.booking_enabled:
+        if business.booking_enabled:
             response = "Sure, I can help schedule that. What day and time works for you?"
             if requested_time:
                 response = "Sure, I can help schedule that. What callback number should we use?"
@@ -87,7 +100,7 @@ def _fallback_result(user_input: str) -> ReceptionistResult:
     if intent == "BUSINESS_HOURS":
         return ReceptionistResult(
             intent=intent,
-            response=f"Our hours are {settings.business_hours}.",
+            response=f"Our hours are {business.business_hours}.",
             fields=fields,
         )
 
@@ -106,17 +119,20 @@ def _fallback_result(user_input: str) -> ReceptionistResult:
     )
 
 
-def _system_prompt() -> str:
-    booking_status = "enabled" if settings.booking_enabled else "disabled"
+def _system_prompt(business: BusinessContext) -> str:
+    booking_status = "enabled" if business.booking_enabled else "disabled"
+    knowledge_text = business.knowledge_text.strip()
+    knowledge_section = f" Business knowledge: {knowledge_text}." if knowledge_text else ""
     return (
-        f"You are the front-desk receptionist for {settings.business_name}. "
+        f"You are the front-desk receptionist for {business.name}. "
         "Classify the caller's request into exactly one of these intents: "
         "BOOK_APPOINTMENT, BUSINESS_HOURS, CALLBACK_REQUEST, GENERAL_QUESTION. "
         "Return valid JSON only with this exact shape: "
         '{"intent":"...","response":"...","fields":{}}. '
         "Keep the response short, phone-friendly, and limited to one or two short sentences. "
-        f"Business hours are {settings.business_hours}. "
+        f"Business hours are {business.business_hours}. "
         f"Booking by phone is {booking_status}. "
+        f"{knowledge_section}"
         "For BOOK_APPOINTMENT, ask for day/time or callback number if missing. "
         "For BUSINESS_HOURS, answer directly with the hours. "
         "For CALLBACK_REQUEST, ask for a callback number if missing. "
@@ -124,16 +140,16 @@ def _system_prompt() -> str:
     )
 
 
-def _coerce_result(payload: object, user_input: str) -> ReceptionistResult:
+def _coerce_result(payload: object, user_input: str, business: BusinessContext) -> ReceptionistResult:
     if not isinstance(payload, dict):
-        return _fallback_result(user_input)
+        return _fallback_result(user_input, business)
 
     intent = payload.get("intent")
     response = payload.get("response")
     fields = payload.get("fields")
 
     if intent not in INTENTS or not isinstance(response, str) or not response.strip():
-        return _fallback_result(user_input)
+        return _fallback_result(user_input, business)
 
     if not isinstance(fields, dict):
         fields = {}
@@ -142,7 +158,9 @@ def _coerce_result(payload: object, user_input: str) -> ReceptionistResult:
     return ReceptionistResult(intent=intent, response=" ".join(response.split()), fields=clean_fields)
 
 
-def detect_and_respond(user_input: str) -> ReceptionistResult:
+def detect_and_respond(user_input: str, business: BusinessContext | None = None) -> ReceptionistResult:
+    business = business or BusinessContext()
+
     if not user_input:
         _log_ai_mode("mode=fallback reason=empty_input")
         return ReceptionistResult(
@@ -154,27 +172,27 @@ def detect_and_respond(user_input: str) -> ReceptionistResult:
     client = _get_client()
     if client is None:
         _log_ai_mode("mode=fallback reason=missing_api_key")
-        return _fallback_result(user_input)
+        return _fallback_result(user_input, business)
 
     try:
         response = client.chat.completions.create(
             model=settings.openai_model,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": _system_prompt(business)},
                 {"role": "user", "content": user_input},
             ],
             temperature=0.2,
-            max_tokens=140,
+            max_completion_tokens=140,
         )
         content = (response.choices[0].message.content or "").strip()
         if not content:
             _log_ai_mode("mode=fallback reason=empty_model_response")
-            return _fallback_result(user_input)
-        result = _coerce_result(json.loads(content), user_input)
+            return _fallback_result(user_input, business)
+        result = _coerce_result(json.loads(content), user_input, business)
     except Exception as exc:
         _log_ai_mode(f"mode=fallback reason=openai_error error={exc}")
-        return _fallback_result(user_input)
+        return _fallback_result(user_input, business)
 
     _log_ai_mode(f"mode=openai model={settings.openai_model} intent={result.intent}")
     return result

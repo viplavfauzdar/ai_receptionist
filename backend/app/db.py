@@ -9,18 +9,23 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-def ensure_call_log_columns():
+def ensure_sqlite_compatibility():
     inspector = inspect(engine)
-    if "call_logs" not in inspector.get_table_names():
-        return
-
-    existing_columns = {column["name"] for column in inspector.get_columns("call_logs")}
     statements: list[str] = []
 
-    if "detected_intent" not in existing_columns:
-        statements.append("ALTER TABLE call_logs ADD COLUMN detected_intent VARCHAR(64)")
-    if "intent_data" not in existing_columns:
-        statements.append("ALTER TABLE call_logs ADD COLUMN intent_data TEXT")
+    if "call_logs" in inspector.get_table_names():
+        call_log_columns = {column["name"] for column in inspector.get_columns("call_logs")}
+        if "detected_intent" not in call_log_columns:
+            statements.append("ALTER TABLE call_logs ADD COLUMN detected_intent VARCHAR(64)")
+        if "intent_data" not in call_log_columns:
+            statements.append("ALTER TABLE call_logs ADD COLUMN intent_data TEXT")
+        if "business_id" not in call_log_columns:
+            statements.append("ALTER TABLE call_logs ADD COLUMN business_id INTEGER")
+
+    if "appointment_requests" in inspector.get_table_names():
+        appointment_columns = {column["name"] for column in inspector.get_columns("appointment_requests")}
+        if "business_id" not in appointment_columns:
+            statements.append("ALTER TABLE appointment_requests ADD COLUMN business_id INTEGER")
 
     if not statements:
         return
