@@ -93,6 +93,10 @@ For LLM mode, edit `backend/.env` before starting the server and set a real Open
 ```env
 OPENAI_API_KEY=your_real_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
+MAX_CALL_TURNS=12
+MAX_LLM_CALLS_PER_SESSION=6
+ENABLE_BASIC_RATE_LIMITING=true
+MAX_NEW_CALLS_PER_NUMBER_PER_HOUR=5
 GOOGLE_CALENDAR_ENABLED=true
 GOOGLE_CALENDAR_ID=primary
 GOOGLE_CLIENT_SECRETS_FILE=./credentials.json
@@ -131,6 +135,8 @@ Behavior:
 - Model output is validated and sanitized before the `/voice` route uses it, so malformed JSON, missing fields, invalid intent/state values, empty content, and timeout/error cases all recover to a safe fallback response instead of breaking the Twilio flow.
 - The backend validates the `X-Twilio-Signature` header by default. For local development behind `ngrok`, you can temporarily set `DISABLE_TWILIO_SIGNATURE_VALIDATION=true`.
 - CORS is restricted by `CORS_ALLOWED_ORIGINS`; the default allows only local frontend origins.
+- Abuse protections are config-driven: `MAX_CALL_TURNS` ends runaway sessions cleanly, `MAX_LLM_CALLS_PER_SESSION` stops repeated model calls and switches to deterministic fallback, and `ENABLE_BASIC_RATE_LIMITING` plus `MAX_NEW_CALLS_PER_NUMBER_PER_HOUR` throttle repeated new calls from the same caller number.
+- If Twilio sends a malformed `/voice` webhook without required identifiers such as `CallSid` or `From`, the backend returns a short TwiML apology and ends the call instead of crashing.
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
 - When Google Calendar is enabled and a booking is complete, the backend creates a real calendar event and confirms it to the caller. If calendar creation fails, the request is still saved and the caller gets a fallback confirmation.
 - Before creating the Google Calendar event, the backend checks the requested window for conflicts. If the slot overlaps an existing active event, the backend does not create the event and asks the caller for another time.
@@ -168,6 +174,10 @@ Open:
 Backend `.env`:
 - `OPENAI_API_KEY` required for real LLM mode
 - `OPENAI_MODEL=gpt-4o-mini`
+- `MAX_CALL_TURNS=12`
+- `MAX_LLM_CALLS_PER_SESSION=6`
+- `ENABLE_BASIC_RATE_LIMITING=true`
+- `MAX_NEW_CALLS_PER_NUMBER_PER_HOUR=5`
 - `GOOGLE_CALENDAR_ENABLED=true`
 - `GOOGLE_CALENDAR_ID=primary`
 - `GOOGLE_CLIENT_SECRETS_FILE=./credentials.json`
@@ -196,6 +206,7 @@ Frontend `.env.local`:
 - Appointment booking is intentionally simple: it only persists when the flow is complete enough to save.
 - Booking requests are saved only after `appointment_day`, `appointment_time`, `callback_number`, and `caller_name` are present.
 - Callback requests are saved only after `callback_number` and `caller_name` are present.
+- Call sessions also track `turn_count`, `llm_call_count`, and `last_protection_reason` to stop runaway loops and excessive model usage.
 - The Twilio voice webhook contract remains `POST /voice`.
 - The receptionist is LLM-first when `OPENAI_API_KEY` is configured.
 - Booking and callback intents create a simple database entry in `appointment_requests`.
@@ -205,6 +216,10 @@ Frontend `.env.local`:
 - For production, replace SQLite with Postgres and add real calendar integration.
 - Twilio Gather speech handling is implemented in `/voice` with `speech_timeout="auto"`, `timeout=3`, and `action_on_empty_result=True`.
 - Silent turns are tracked in session slot data with a small `silence_count` so the call does not fall into redirect loops.
+- If a session exceeds `MAX_CALL_TURNS`, the backend returns a short goodbye and hangs up.
+- If a session exceeds `MAX_LLM_CALLS_PER_SESSION`, the backend stops invoking OpenAI for that call and uses the deterministic fallback flow instead.
+- If basic rate limiting is enabled and a caller starts too many new calls within an hour, the backend returns a polite rate-limit message and hangs up without creating a new session.
+- Protection triggers are logged in `call_logs.protection_reason` with values such as `turn_limit_exceeded`, `llm_limit_exceeded`, `caller_rate_limited`, and `malformed_request`.
 - If Google Calendar booking is enabled, successful bookings persist `calendar_event_id`, `calendar_event_link`, `scheduled_start`, and `scheduled_end` on `appointment_requests`.
 - Calendar conflict detection ignores cancelled events.
 - Overlap rule: any real interval intersection blocks the slot, but an appointment that starts exactly when a prior event ends is allowed.

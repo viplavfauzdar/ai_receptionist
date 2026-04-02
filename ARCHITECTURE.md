@@ -13,6 +13,7 @@ At a high level:
 - OpenAI is used to generate structured receptionist responses when an API key is configured.
 - A fallback rule-based path is used when the API key is missing or the model output is unusable.
 - Twilio signatures are validated on `/voice` by default before any session or DB work happens.
+- Lightweight abuse protections on `/voice` stop malformed requests, runaway sessions, excessive LLM usage, and repeated spam calls.
 - Completed bookings can optionally create Google Calendar events through a small backend service layer.
 
 The backend is intentionally small. Most logic lives in:
@@ -161,6 +162,13 @@ For local development, signature validation can be disabled explicitly with:
 
 - `DISABLE_TWILIO_SIGNATURE_VALIDATION=true`
 
+Immediately after signature validation, the backend applies lightweight request protections:
+
+- missing `CallSid` or `From` is treated as `malformed_request`
+- new calls can be rate limited by caller number
+- existing sessions can be stopped after `MAX_CALL_TURNS`
+- LLM usage can be capped after `MAX_LLM_CALLS_PER_SESSION`
+
 ### Step 2: Business Lookup
 
 The backend resolves the business using the incoming Twilio `To` number.
@@ -177,7 +185,7 @@ This supports basic multi-tenant routing by Twilio number.
 
 The backend loads or creates a `CallSession` using `CallSid`.
 
-If `CallSid` is missing, the request still works, but no session persistence is used.
+If `CallSid` or `From` is missing, the request is treated as malformed and the route returns a short TwiML apology plus `Hangup` instead of entering the normal session flow.
 
 ### Step 4: Session Context Construction
 
@@ -187,6 +195,8 @@ The backend converts the DB session row into an in-memory session context contai
 - current state
 - accumulated slot values
 - recent transcript
+- turn count
+- LLM call count
 
 This is passed to the AI layer.
 
@@ -204,7 +214,8 @@ If `SpeechResult` is empty:
 If `SpeechResult` is present:
 
 - the user utterance is appended to transcript
-- the AI layer is called
+- the session turn cap is checked before the normal turn logic continues
+- the AI layer is called unless the per-session LLM cap has already been reached
 
 ### Step 6: `detect_and_respond`
 
@@ -224,6 +235,8 @@ It returns a structured result:
   "fields": {}
 }
 ```
+
+If the LLM cap has already been reached for that call, `backend/app/main.py` forces `backend/app/ai.py` into deterministic fallback mode for the rest of the session.
 
 ### Step 7: Slot Extraction and Session Update
 
@@ -245,6 +258,13 @@ Silence tracking also lives in slot storage through:
 ### Step 8: DB Logging
 
 Each spoken turn is logged into `call_logs`.
+
+Protection triggers are also recorded in `call_logs.protection_reason`, using values such as:
+
+- `turn_limit_exceeded`
+- `llm_limit_exceeded`
+- `caller_rate_limited`
+- `malformed_request`
 
 Depending on the state:
 
@@ -299,6 +319,9 @@ Fields:
 - `current_state`
 - `slot_data_json`
 - `transcript_json`
+- `turn_count`
+- `llm_call_count`
+- `last_protection_reason`
 - `is_active`
 - `created_at`
 - `updated_at`
@@ -329,6 +352,8 @@ Typical keys:
 - `caller_name`
 - `silence_count`
 - `request_saved`
+
+Session-wide protection counters such as `turn_count` and `llm_call_count` are stored as first-class columns rather than JSON slots so they can be enforced deterministically at the route layer.
 
 ### State Machine Behavior
 
@@ -611,6 +636,7 @@ The suite currently exercises:
 - route behavior
 - Twilio signature validation
 - CORS behavior for allowed and disallowed origins
+- turn caps, LLM caps, caller rate limiting, and malformed-request handling
 - empty-gather silence handling and repeated-silence hangup behavior
 - mocked Google Calendar success and failure behavior
 - DB writes
@@ -644,6 +670,10 @@ Important local env vars:
 - `DISABLE_TWILIO_SIGNATURE_VALIDATION`
 - `CORS_ALLOWED_ORIGINS`
 - `OPENAI_API_KEY`
+- `MAX_CALL_TURNS`
+- `MAX_LLM_CALLS_PER_SESSION`
+- `ENABLE_BASIC_RATE_LIMITING`
+- `MAX_NEW_CALLS_PER_NUMBER_PER_HOUR`
 - `DATABASE_URL`
 
 ### Frontend

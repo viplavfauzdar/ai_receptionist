@@ -82,6 +82,25 @@ def test_voice_rejects_invalid_twilio_signature(client, db_session: sessionmaker
         assert db.query(CallSession).count() == 0
 
 
+def test_voice_handles_malformed_request_without_crashing(client, db_session: sessionmaker):
+    res = _post_voice(
+        client,
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="What are your hours?",
+    )
+
+    assert res.status_code == 200
+    xml = _parse_xml(res.text)
+    assert xml.find("Hangup") is not None
+    assert "could not process this call" in res.text
+
+    with db_session() as db:
+        log = db.query(CallLog).one()
+        assert log.protection_reason == "malformed_request"
+        assert db.query(CallSession).count() == 0
+
+
 def test_voice_accepts_valid_twilio_signature(client, db_session: sessionmaker, monkeypatch, twilio_signature):
     monkeypatch.setattr(settings, "disable_twilio_signature_validation", False)
     payload = {
@@ -746,3 +765,136 @@ def test_voice_repeated_silence_ends_call_cleanly(client, db_session: sessionmak
         slot_data = json.loads(session.slot_data_json)
         assert slot_data["silence_count"] == "3"
         assert session.is_active is False
+
+
+def test_voice_ends_call_when_turn_limit_is_exceeded(client, db_session: sessionmaker, monkeypatch):
+    monkeypatch.setattr(settings, "max_call_turns", 2)
+    call_sid = "CA-turn-limit"
+
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="ringing",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="What are your hours?",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Are you open tomorrow?",
+    )
+
+    assert res.status_code == 200
+    xml = _parse_xml(res.text)
+    assert xml.find("Hangup") is not None
+    assert xml.find("Gather") is None
+    assert "end this call for now" in res.text
+
+    with db_session() as db:
+        session = db.query(CallSession).filter(CallSession.call_sid == call_sid).one()
+        assert session.turn_count == 2
+        assert session.last_protection_reason == "turn_limit_exceeded"
+        assert session.is_active is False
+        log = db.query(CallLog).filter(CallLog.call_sid == call_sid).order_by(CallLog.id.desc()).first()
+        assert log.protection_reason == "turn_limit_exceeded"
+
+
+def test_voice_caps_llm_calls_and_switches_to_fallback(client, db_session: sessionmaker, monkeypatch):
+    monkeypatch.setattr(settings, "max_llm_calls_per_session", 1)
+    monkeypatch.setattr(settings, "enable_basic_rate_limiting", False)
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+
+    def _should_not_run():
+        raise AssertionError("LLM client should not be created after the per-session cap is hit")
+
+    monkeypatch.setattr("app.ai._get_client", _should_not_run)
+    call_sid = "CA-llm-cap"
+
+    with db_session() as db:
+        db.add(
+            CallSession(
+                call_sid=call_sid,
+                from_number="+15551230000",
+                to_number="+15557654321",
+                current_intent="BOOK_APPOINTMENT",
+                current_state="COLLECTING_APPOINTMENT_TIME",
+                slot_data_json=json.dumps({"appointment_day": "Tuesday"}),
+                transcript_json="[]",
+                turn_count=1,
+                llm_call_count=1,
+                is_active=True,
+            )
+        )
+        db.commit()
+
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm",
+    )
+
+    assert res.status_code == 200
+    assert "What callback number should we use?" in res.text
+
+    with db_session() as db:
+        session = db.query(CallSession).filter(CallSession.call_sid == call_sid).one()
+        assert session.llm_call_count == 1
+        assert session.last_protection_reason == "llm_limit_exceeded"
+        log = db.query(CallLog).filter(CallLog.call_sid == call_sid).order_by(CallLog.id.desc()).first()
+        assert log.protection_reason == "llm_limit_exceeded"
+        assert log.detected_intent == "BOOK_APPOINTMENT"
+
+
+def test_voice_rate_limits_excessive_new_calls_from_same_number(client, db_session: sessionmaker, monkeypatch):
+    monkeypatch.setattr(settings, "enable_basic_rate_limiting", True)
+    monkeypatch.setattr(settings, "max_new_calls_per_number_per_hour", 1)
+    from_number = "+15559990000"
+
+    with db_session() as db:
+        db.add(
+            CallSession(
+                call_sid="CA-existing-hourly-call",
+                from_number=from_number,
+                to_number="+15557654321",
+                current_intent="GENERAL_QUESTION",
+                current_state="GREETING_SENT",
+                slot_data_json="{}",
+                transcript_json="[]",
+                turn_count=1,
+                llm_call_count=0,
+                is_active=False,
+            )
+        )
+        db.commit()
+
+    res = _post_voice(
+        client,
+        CallSid="CA-rate-limited",
+        From=from_number,
+        To="+15557654321",
+        CallStatus="ringing",
+    )
+
+    assert res.status_code == 200
+    xml = _parse_xml(res.text)
+    assert xml.find("Hangup") is not None
+    assert "too many calls from this number" in res.text
+
+    with db_session() as db:
+        assert db.query(CallSession).filter(CallSession.call_sid == "CA-rate-limited").count() == 0
+        log = db.query(CallLog).filter(CallLog.call_sid == "CA-rate-limited").one()
+        assert log.protection_reason == "caller_rate_limited"

@@ -4,6 +4,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    max_call_turns: int = 12
+    max_llm_calls_per_session: int = 6
+    enable_basic_rate_limiting: bool = True
+    max_new_calls_per_number_per_hour: int = 5
     google_calendar_enabled: bool = False
     google_calendar_id: str = "primary"
     google_client_secrets_file: str = "./credentials.json"

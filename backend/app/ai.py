@@ -456,6 +456,7 @@ def detect_and_respond(
     user_input: str,
     business: BusinessContext | None = None,
     session: SessionContext | None = None,
+    force_fallback_reason: str | None = None,
 ) -> ReceptionistResult:
     business = business or BusinessContext()
     session = session or SessionContext()
@@ -468,6 +469,10 @@ def detect_and_respond(
             response="Could you please repeat that?",
             fields={},
         )
+
+    if force_fallback_reason:
+        _log_ai_mode(f"mode=fallback reason={force_fallback_reason}")
+        return _fallback_result(user_input, business, session)
 
     client = _get_client()
     if client is None:

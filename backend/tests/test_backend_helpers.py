@@ -85,11 +85,22 @@ def test_ensure_sqlite_compatibility_noops_when_columns_present(monkeypatch: pyt
 
     class FakeInspector:
         def get_table_names(self):
-            return ["call_logs", "appointment_requests", "businesses"]
+            return ["call_logs", "call_sessions", "appointment_requests", "businesses"]
 
         def get_columns(self, table_name: str):
             if table_name == "call_logs":
-                return [{"name": "detected_intent"}, {"name": "intent_data"}, {"name": "business_id"}]
+                return [
+                    {"name": "detected_intent"},
+                    {"name": "intent_data"},
+                    {"name": "business_id"},
+                    {"name": "protection_reason"},
+                ]
+            if table_name == "call_sessions":
+                return [
+                    {"name": "turn_count"},
+                    {"name": "llm_call_count"},
+                    {"name": "last_protection_reason"},
+                ]
             if table_name == "businesses":
                 return [{"name": "twilio_number_normalized"}]
             return [
@@ -235,10 +246,13 @@ def test_main_request_and_session_helpers(db_session):
         assert exact is not None
         assert exact.twilio_number_normalized == "6784624453"
 
-        assert main_module._get_or_create_session(db, None, "+1", "+2") is None
-        created = main_module._get_or_create_session(db, "CA-helper", "+1", "+2")
+        assert main_module._get_or_create_session(db, None, "+1", "+2") == (None, False)
+        created, created_new = main_module._get_or_create_session(db, "CA-helper", "+1", "+2")
         assert created is not None
-        existing = main_module._get_or_create_session(db, "CA-helper", "+3", "+4")
+        assert created_new is True
+        existing, existing_new = main_module._get_or_create_session(db, "CA-helper", "+3", "+4")
+        assert existing is not None
+        assert existing_new is False
         assert existing.id == created.id
         assert existing.from_number == "+3"
         assert existing.to_number == "+4"

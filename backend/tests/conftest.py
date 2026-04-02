@@ -24,6 +24,10 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     original = {
         "openai_api_key": ai_module.settings.openai_api_key,
         "openai_model": ai_module.settings.openai_model,
+        "max_call_turns": ai_module.settings.max_call_turns,
+        "max_llm_calls_per_session": ai_module.settings.max_llm_calls_per_session,
+        "enable_basic_rate_limiting": ai_module.settings.enable_basic_rate_limiting,
+        "max_new_calls_per_number_per_hour": ai_module.settings.max_new_calls_per_number_per_hour,
         "google_calendar_enabled": ai_module.settings.google_calendar_enabled,
         "google_calendar_id": ai_module.settings.google_calendar_id,
         "google_client_secrets_file": ai_module.settings.google_client_secrets_file,
@@ -36,6 +40,10 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     }
     monkeypatch.setattr(ai_module.settings, "openai_api_key", "")
     monkeypatch.setattr(ai_module.settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(ai_module.settings, "max_call_turns", 12)
+    monkeypatch.setattr(ai_module.settings, "max_llm_calls_per_session", 6)
+    monkeypatch.setattr(ai_module.settings, "enable_basic_rate_limiting", True)
+    monkeypatch.setattr(ai_module.settings, "max_new_calls_per_number_per_hour", 5)
     monkeypatch.setattr(ai_module.settings, "google_calendar_enabled", False)
     monkeypatch.setattr(ai_module.settings, "google_calendar_id", "primary")
     monkeypatch.setattr(ai_module.settings, "google_client_secrets_file", "./credentials.json")

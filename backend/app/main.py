@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -169,15 +170,15 @@ def _get_or_create_session(
     call_sid: str | None,
     from_number: str | None,
     to_number: str | None,
-) -> CallSession | None:
+) -> tuple[CallSession | None, bool]:
     if not call_sid:
-        return None
+        return None, False
 
     session = db.query(CallSession).filter(CallSession.call_sid == call_sid).first()
     if session:
         session.from_number = from_number
         session.to_number = to_number
-        return session
+        return session, False
 
     session = CallSession(
         call_sid=call_sid,
@@ -187,11 +188,13 @@ def _get_or_create_session(
         current_state="NEW",
         slot_data_json="{}",
         transcript_json="[]",
+        turn_count=0,
+        llm_call_count=0,
         is_active=True,
     )
     db.add(session)
     db.flush()
-    return session
+    return session, True
 
 
 def _build_session_context(session: CallSession | None) -> SessionContext:
@@ -256,6 +259,77 @@ def _build_requested_time(slot_data: dict[str, str]) -> str | None:
         )
         or None
     )
+
+
+def _build_terminal_voice_response(message: str) -> Response:
+    response = VoiceResponse()
+    response.say(message)
+    response.hangup()
+    return Response(content=str(response), media_type="application/xml")
+
+
+def _record_protection_log(
+    db: Session,
+    *,
+    reason: str,
+    call_sid: str | None,
+    from_number: str | None,
+    to_number: str | None,
+    call_status: str | None,
+    ai_response: str,
+    business_id: int | None = None,
+    speech_input: str | None = None,
+    session: CallSession | None = None,
+) -> None:
+    _log_voice(
+        "request_protection "
+        f"reason={reason} call_sid={call_sid} from_number={from_number} to_number={to_number}"
+    )
+    if session is not None:
+        session.last_protection_reason = reason
+    db.add(
+        CallLog(
+            business_id=business_id,
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            speech_input=speech_input,
+            ai_response=ai_response,
+            call_status=call_status,
+            detected_intent=session.current_intent if session is not None else "GENERAL_QUESTION",
+            intent_data=json.dumps(
+                {
+                    "intent": session.current_intent if session is not None else "GENERAL_QUESTION",
+                    "state": session.current_state if session is not None else "NEW",
+                    "response": ai_response,
+                    "fields": _load_json_dict(session.slot_data_json) if session is not None else {},
+                }
+            ),
+            protection_reason=reason,
+        )
+    )
+
+
+def _count_recent_calls_for_number(db: Session, from_number: str) -> int:
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    return (
+        db.query(CallSession)
+        .filter(
+            CallSession.from_number == from_number,
+            CallSession.created_at >= cutoff,
+        )
+        .count()
+    )
+
+
+def _is_rate_limited_new_call(db: Session, from_number: str | None) -> bool:
+    if not settings.enable_basic_rate_limiting or not from_number:
+        return False
+    return _count_recent_calls_for_number(db, from_number) >= settings.max_new_calls_per_number_per_hour
+
+
+def _is_terminal_call_status(call_status: str | None) -> bool:
+    return call_status in {"completed", "canceled", "failed", "busy", "no-answer"}
 
 
 def _should_create_calendar_event(result_intent: str, result_state: str, slot_data: dict[str, str]) -> bool:
@@ -353,7 +427,39 @@ async def voice(request: Request, db: Session = Depends(get_db)):
     from_number = form.get("From")
     to_number = form.get("To")
     call_status = form.get("CallStatus")
-    session = _get_or_create_session(db, call_sid, from_number, to_number)
+
+    if not call_sid or not from_number:
+        prompt = "Sorry, we could not process this call. Please try again later."
+        _record_protection_log(
+            db,
+            reason="malformed_request",
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            call_status=call_status,
+            ai_response=prompt,
+            speech_input=speech,
+        )
+        db.commit()
+        return _build_terminal_voice_response(prompt)
+
+    existing_session = db.query(CallSession).filter(CallSession.call_sid == call_sid).first()
+    if existing_session is None and _is_rate_limited_new_call(db, from_number):
+        prompt = "We are receiving too many calls from this number right now. Please try again later."
+        _record_protection_log(
+            db,
+            reason="caller_rate_limited",
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            call_status=call_status,
+            ai_response=prompt,
+            speech_input=speech,
+        )
+        db.commit()
+        return _build_terminal_voice_response(prompt)
+
+    session, _ = _get_or_create_session(db, call_sid, from_number, to_number)
     session_context = _build_session_context(session)
     business = _resolve_business(db, to_number)
     business_context = _build_business_context(business)
@@ -365,6 +471,27 @@ async def voice(request: Request, db: Session = Depends(get_db)):
     )
 
     response = VoiceResponse()
+
+    if session is not None and session.turn_count >= settings.max_call_turns:
+        prompt = "We need to end this call for now. Please call back if you still need help."
+        session.is_active = False
+        _record_protection_log(
+            db,
+            reason="turn_limit_exceeded",
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            call_status=call_status,
+            ai_response=prompt,
+            business_id=business_context.id,
+            speech_input=speech,
+            session=session,
+        )
+        db.commit()
+        return _build_terminal_voice_response(prompt)
+
+    if session is not None:
+        session.turn_count = (session.turn_count or 0) + 1
 
     if not speech:
         merged_slot_data = dict(session_context.slot_data)
@@ -379,6 +506,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                 )
                 session.current_state = "GREETING_SENT"
                 session.slot_data_json = json.dumps(merged_slot_data)
+                session.last_protection_reason = None
                 session.is_active = True
                 db.commit()
             response.append(gather)
@@ -393,6 +521,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                 _append_transcript(session_context.transcript, "assistant", prompt)
             )
             session.slot_data_json = json.dumps(merged_slot_data)
+            session.last_protection_reason = None
             session.is_active = not should_end_call
 
         log = CallLog(
@@ -412,6 +541,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                     "fields": merged_slot_data,
                 }
             ),
+            protection_reason=None,
         )
         db.add(log)
         db.commit()
@@ -425,7 +555,24 @@ async def voice(request: Request, db: Session = Depends(get_db)):
 
     transcript = _append_transcript(session_context.transcript, "user", speech)
     session_context.transcript = transcript
-    result = detect_and_respond(speech, business_context, session_context)
+    protection_reason: str | None = None
+    llm_limit_exceeded = (
+        session is not None
+        and bool(settings.openai_api_key)
+        and session.llm_call_count >= settings.max_llm_calls_per_session
+    )
+    if llm_limit_exceeded:
+        protection_reason = "llm_limit_exceeded"
+        result = detect_and_respond(
+            speech,
+            business_context,
+            session_context,
+            force_fallback_reason=protection_reason,
+        )
+    else:
+        if session is not None and settings.openai_api_key:
+            session.llm_call_count = (session.llm_call_count or 0) + 1
+        result = detect_and_respond(speech, business_context, session_context)
     merged_slot_data = _clear_silence_count(_merge_session_slots(session_context.slot_data, result.fields))
     speech_safe_response = _build_speech_safe_response(
         result.intent,
@@ -498,6 +645,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         call_status=call_status,
         detected_intent=result.intent,
         intent_data=result.to_json(),
+        protection_reason=protection_reason,
     )
     db.add(log)
 
@@ -506,7 +654,8 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         session.current_state = result.state
         session.slot_data_json = json.dumps(merged_slot_data)
         session.transcript_json = json.dumps(updated_transcript)
-        session.is_active = call_status not in {"completed", "canceled", "failed", "busy", "no-answer"}
+        session.last_protection_reason = protection_reason
+        session.is_active = not _is_terminal_call_status(call_status)
 
     db.commit()
 

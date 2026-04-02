@@ -31,6 +31,17 @@ def ensure_sqlite_compatibility():
             statements.append("ALTER TABLE call_logs ADD COLUMN intent_data TEXT")
         if "business_id" not in call_log_columns:
             statements.append("ALTER TABLE call_logs ADD COLUMN business_id INTEGER")
+        if "protection_reason" not in call_log_columns:
+            statements.append("ALTER TABLE call_logs ADD COLUMN protection_reason VARCHAR(64)")
+
+    if "call_sessions" in table_names:
+        session_columns = {column["name"] for column in inspector.get_columns("call_sessions")}
+        if "turn_count" not in session_columns:
+            statements.append("ALTER TABLE call_sessions ADD COLUMN turn_count INTEGER DEFAULT 0")
+        if "llm_call_count" not in session_columns:
+            statements.append("ALTER TABLE call_sessions ADD COLUMN llm_call_count INTEGER DEFAULT 0")
+        if "last_protection_reason" not in session_columns:
+            statements.append("ALTER TABLE call_sessions ADD COLUMN last_protection_reason VARCHAR(64)")
 
     if "appointment_requests" in table_names:
         appointment_columns = {column["name"] for column in inspector.get_columns("appointment_requests")}

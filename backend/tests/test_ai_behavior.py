@@ -230,6 +230,19 @@ def test_openai_timeout_gracefully_falls_back(mock_openai):
     assert result.response.startswith("Our hours are")
 
 
+def test_force_fallback_reason_skips_llm_call(env_overrides, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(ai_module.settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(ai_module, "_get_client", lambda: (_ for _ in ()).throw(AssertionError("LLM should not run")))
+    result = detect_and_respond(
+        "What are your hours?",
+        BusinessContext(),
+        SessionContext(),
+        force_fallback_reason="llm_limit_exceeded",
+    )
+    assert result.intent == "BUSINESS_HOURS"
+    assert result.response == "Our hours are Mon-Fri 9 AM to 5 PM."
+
+
 def test_business_context_influences_fallback_response(env_overrides):
     result = detect_and_respond(
         "What are your hours?",

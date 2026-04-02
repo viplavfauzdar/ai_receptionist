@@ -31,6 +31,7 @@ class CallLog(Base):
     call_status = Column(String(64), nullable=True)
     detected_intent = Column(String(64), nullable=True)
     intent_data = Column(Text, nullable=True)
+    protection_reason = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -45,6 +46,9 @@ class CallSession(Base):
     current_state = Column(String(64), nullable=True)
     slot_data_json = Column(Text, nullable=True)
     transcript_json = Column(Text, nullable=True)
+    turn_count = Column(Integer, default=0)
+    llm_call_count = Column(Integer, default=0)
+    last_protection_reason = Column(String(64), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
