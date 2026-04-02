@@ -13,6 +13,8 @@ class CallLog(Base):
     speech_input = Column(Text, nullable=True)
     ai_response = Column(Text, nullable=True)
     call_status = Column(String(64), nullable=True)
+    detected_intent = Column(String(64), nullable=True)
+    intent_data = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

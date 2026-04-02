@@ -10,6 +10,8 @@ class CallLogOut(BaseModel):
     speech_input: str | None = None
     ai_response: str | None = None
     call_status: str | None = None
+    detected_intent: str | None = None
+    intent_data: str | None = None
     created_at: datetime
 
     class Config:

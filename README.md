@@ -13,6 +13,35 @@ Next.js dashboard with:
 - settings page
 - simple overview cards
 
+## Architecture
+
+The backend does not connect to ngrok directly. `ngrok` is a separate local process that exposes your local FastAPI server to the public internet so Twilio can reach it.
+
+```mermaid
+flowchart LR
+    Caller[Phone Caller] --> Twilio[Twilio Voice]
+    Twilio -->|HTTP POST /voice| Ngrok[ngrok public URL]
+    Ngrok -->|Tunnel to localhost:8000| FastAPI[FastAPI backend]
+    FastAPI --> AI[OpenAI or fallback reply logic]
+    FastAPI --> DB[(SQLite)]
+    FastAPI -->|TwiML XML with <Say> and <Gather>| Ngrok
+    Ngrok --> Twilio
+    Twilio -->|Text-to-speech playback| Caller
+```
+
+Runtime responsibilities:
+- Twilio handles the phone call, speech capture, and text-to-speech playback.
+- `ngrok` only forwards public webhook traffic to your local machine.
+- FastAPI handles `/voice`, generates the reply text, and logs call data.
+- SQLite stores call logs and appointment requests.
+- OpenAI generates the receptionist response when `OPENAI_API_KEY` is configured; otherwise the app uses fallback logic.
+
+Code locations:
+- Twilio webhook and TwiML generation: [`backend/app/main.py`](backend/app/main.py)
+- Reply generation and intent detection: [`backend/app/ai.py`](backend/app/ai.py)
+- Database connection: [`backend/app/db.py`](backend/app/db.py)
+- Models: [`backend/app/models.py`](backend/app/models.py)
+
 ## 1) Backend setup
 
 ```bash
@@ -45,6 +74,8 @@ Behavior:
 ```bash
 ngrok http 8000
 ```
+
+This command is not run by the app. Start it manually in a separate terminal after the FastAPI server is already running.
 
 Set your Twilio phone number voice webhook to:
 
