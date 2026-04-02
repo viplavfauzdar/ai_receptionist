@@ -4,6 +4,7 @@ Twilio + FastAPI backend with:
 - OpenAI response generation
 - structured intent detection
 - basic multi-tenant business lookup
+- persistent per-call session state
 - SQLite logging via SQLAlchemy
 - basic appointment capture
 - health check
@@ -35,8 +36,8 @@ Runtime responsibilities:
 - Twilio handles the phone call, speech capture, and text-to-speech playback.
 - `ngrok` only forwards public webhook traffic to your local machine.
 - FastAPI handles `/voice`, generates the reply text, and logs call data.
-- The AI layer returns structured receptionist results with `intent`, `response`, and `fields`.
-- SQLite stores businesses, call logs, and appointment requests.
+- The AI layer returns structured receptionist results with `intent`, `state`, `response`, and `fields`.
+- SQLite stores businesses, call logs, appointment requests, and call sessions.
 - OpenAI generates the receptionist response when `OPENAI_API_KEY` is configured; otherwise the app uses fallback logic.
 
 Code locations:
@@ -49,6 +50,12 @@ Multi-business resolution:
 - The backend checks the incoming Twilio `To` number on `POST /voice`.
 - If a `businesses` row matches that number, the app uses that business's `greeting`, `business_hours`, `booking_enabled`, and `knowledge_text`.
 - If no row matches, the app falls back to the env-backed defaults from `backend/app/config.py`.
+
+Session state:
+- Each Twilio call is keyed by `CallSid` in the `call_sessions` table.
+- On each `POST /voice`, the backend loads or creates the session, appends the latest user utterance, calls the AI layer with the existing session context, and saves the assistant reply plus updated session state.
+- `slot_data_json` stores collected values such as `appointment_day`, `appointment_time`, and `callback_number`.
+- `transcript_json` stores the recent call transcript so booking flows can continue across turns.
 
 ## 1) Backend setup
 
@@ -66,10 +73,6 @@ For LLM mode, edit `backend/.env` before starting the server and set a real Open
 ```env
 OPENAI_API_KEY=your_real_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
-BUSINESS_NAME=Bright Smile Dental
-BUSINESS_GREETING=Hello, thanks for calling Bright Smile Dental. How can I help you today?
-BUSINESS_HOURS=Mon-Fri 9 AM to 5 PM
-BOOKING_ENABLED=true
 DATABASE_URL=sqlite:///./receptionist.db
 ```
 
@@ -79,6 +82,7 @@ Behavior:
 ```json
 {
   "intent": "BOOK_APPOINTMENT",
+  "state": "COLLECTING_APPOINTMENT_TIME",
   "response": "Sure, I can help schedule that. What day and time works for you?",
   "fields": {}
 }
@@ -86,7 +90,8 @@ Behavior:
 
 - Supported intents are `BOOK_APPOINTMENT`, `BUSINESS_HOURS`, `CALLBACK_REQUEST`, and `GENERAL_QUESTION`.
 - If `OPENAI_API_KEY` is missing or the OpenAI request fails, the backend falls back to simple rule-based intent detection and short canned replies.
-- Business-specific prompts and greetings are used when a matching `businesses.twilio_number` row exists.
+- Business profile data now comes from the `businesses` table, not from `.env`.
+- The `state` value is persisted so the next `/voice` turn can continue from the prior step instead of restarting.
 
 ## 2) Expose locally to Twilio
 
@@ -120,10 +125,6 @@ Open:
 Backend `.env`:
 - `OPENAI_API_KEY` required for real LLM mode
 - `OPENAI_MODEL=gpt-4o-mini`
-- `BUSINESS_NAME=Bright Smile Dental`
-- `BUSINESS_GREETING=Hello, thanks for calling Bright Smile Dental. How can I help you today?`
-- `BUSINESS_HOURS=Mon-Fri 9 AM to 5 PM`
-- `BOOKING_ENABLED=true`
 - `DATABASE_URL=sqlite:///./receptionist.db`
 
 Frontend `.env.local`:
@@ -133,6 +134,8 @@ Frontend `.env.local`:
 
 - This MVP uses SQLite at `backend/receptionist.db`.
 - Multi-tenant mode is basic: one incoming Twilio number maps to one business record.
+- Call sessions are persisted locally in SQLite and keyed by `CallSid`.
+- Business names, greetings, hours, booking settings, and knowledge text are stored in the database.
 - Appointment booking is intentionally simple: it captures requested time and caller info.
 - The Twilio voice webhook contract remains `POST /voice`.
 - The receptionist is LLM-first when `OPENAI_API_KEY` is configured.
@@ -141,6 +144,17 @@ Frontend `.env.local`:
 - Appointment requests now store `business_id`.
 - For production, replace SQLite with Postgres and add real calendar integration.
 - Twilio Gather speech handling is implemented in `/voice`.
+
+Example 3-turn booking flow:
+1. Caller: `I want to book an appointment`
+   Assistant: `Sure, I can help schedule that. What day works for you?`
+   Session state: `COLLECTING_APPOINTMENT_DAY`
+2. Caller: `Tuesday`
+   Assistant: `What time works best for you?`
+   Session state: `COLLECTING_APPOINTMENT_TIME`
+3. Caller: `3 pm, and my number is 555-111-2222`
+   Assistant: `Thanks. I have your day, time, and callback number. We will follow up shortly.`
+   Session state: `BOOKING_COMPLETE`
 
 ## 6) Create A Demo Business
 
@@ -151,6 +165,8 @@ curl -X POST "http://127.0.0.1:8000/api/demo-business?twilio_number=%2B155500011
 ```
 
 Then point your Twilio phone number or test request to use `To=+15550001111`. The webhook will resolve that business and use its greeting and business settings.
+
+The onboarding page at `http://localhost:3000/onboarding` now posts directly to `POST /api/businesses`.
 
 You can also create businesses directly:
 

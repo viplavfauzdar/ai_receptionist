@@ -3,20 +3,62 @@
 import { useState } from "react";
 
 export default function OnboardingPage() {
+  const base = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
   const [form, setForm] = useState({
     businessName: "",
+    twilioNumber: "",
     forwardingNumber: "",
     hours: "",
     greeting: "",
     services: "",
   });
+  const [status, setStatus] = useState<string>("");
+  const [isSaving, setIsSaving] = useState(false);
+
+  async function saveBusiness() {
+    setIsSaving(true);
+    setStatus("");
+
+    try {
+      const res = await fetch(`${base}/api/businesses`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: form.businessName,
+          twilio_number: form.twilioNumber,
+          forwarding_number: form.forwardingNumber || null,
+          greeting: form.greeting || null,
+          business_hours: form.hours || null,
+          booking_enabled: true,
+          knowledge_text: form.services || null,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error("Failed to save business");
+      }
+
+      setStatus("Business saved.")
+      setForm({
+        businessName: "",
+        twilioNumber: "",
+        forwardingNumber: "",
+        hours: "",
+        greeting: "",
+        services: "",
+      });
+    } catch {
+      setStatus("Could not save business.")
+    } finally {
+      setIsSaving(false);
+    }
+  }
 
   return (
     <div className="card">
       <div className="h1">Business Onboarding</div>
       <div className="muted" style={{ marginBottom: 16 }}>
-        This is a functional MVP front end for collecting business setup data.
-        Persisting onboarding to the backend can be your next patch.
+        Create a business record used by the backend to resolve calls by Twilio number.
       </div>
 
       <div className="grid">
@@ -25,6 +67,12 @@ export default function OnboardingPage() {
           placeholder="Business name"
           value={form.businessName}
           onChange={(e) => setForm({ ...form, businessName: e.target.value })}
+        />
+        <input
+          className="input"
+          placeholder="Twilio number"
+          value={form.twilioNumber}
+          onChange={(e) => setForm({ ...form, twilioNumber: e.target.value })}
         />
         <input
           className="input"
@@ -52,10 +100,12 @@ export default function OnboardingPage() {
         />
         <button
           className="button"
-          onClick={() => alert("MVP placeholder: wire this to a POST /api/business endpoint next.")}
+          disabled={isSaving || !form.businessName || !form.twilioNumber}
+          onClick={saveBusiness}
         >
-          Save Onboarding
+          {isSaving ? "Saving..." : "Save Onboarding"}
         </button>
+        {status ? <div className="muted">{status}</div> : null}
       </div>
     </div>
   );
