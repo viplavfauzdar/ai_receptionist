@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from twilio.request_validator import RequestValidator
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
@@ -22,9 +23,19 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     original = {
         "openai_api_key": ai_module.settings.openai_api_key,
         "openai_model": ai_module.settings.openai_model,
+        "twilio_auth_token": ai_module.settings.twilio_auth_token,
+        "disable_twilio_signature_validation": ai_module.settings.disable_twilio_signature_validation,
+        "cors_allowed_origins": ai_module.settings.cors_allowed_origins,
     }
     monkeypatch.setattr(ai_module.settings, "openai_api_key", "")
     monkeypatch.setattr(ai_module.settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(ai_module.settings, "twilio_auth_token", "test-twilio-token")
+    monkeypatch.setattr(ai_module.settings, "disable_twilio_signature_validation", True)
+    monkeypatch.setattr(
+        ai_module.settings,
+        "cors_allowed_origins",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    )
     return original
 
 
@@ -85,3 +96,12 @@ def mock_openai(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(ai_module, "_get_client", lambda: FakeOpenAIClient(content=content, error=error))
 
     return _apply
+
+
+@pytest.fixture
+def twilio_signature():
+    def _build(url: str, params: dict[str, str]) -> str:
+        validator = RequestValidator(ai_module.settings.twilio_auth_token)
+        return validator.compute_signature(url, params)
+
+    return _build

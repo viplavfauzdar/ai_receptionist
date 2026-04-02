@@ -1,3 +1,4 @@
+import app.ai as ai_module
 from app.ai import (
     BusinessContext,
     SessionContext,
@@ -16,6 +17,14 @@ def test_format_phone_number_for_speech_keeps_plus_prefix():
 
 def test_format_phone_number_for_speech_handles_non_digit_string():
     assert format_phone_number_for_speech(" ext ") == "ext"
+
+
+def test_openai_client_helper_returns_none_without_key(env_overrides):
+    assert ai_module._get_client() is None
+
+
+def test_requested_time_extraction_handles_day_and_time():
+    assert ai_module._extract_requested_time("next Tuesday at 3 pm please") == "Tuesday at 3 pm please"
 
 
 def test_fallback_mode_returns_booking_response(env_overrides):
@@ -63,6 +72,34 @@ def test_fallback_mode_preserves_booking_session_state(env_overrides):
     assert result.fields["appointment_time"] == "3 pm"
 
 
+def test_fallback_mode_collects_caller_name_before_booking_is_complete(env_overrides):
+    session = SessionContext(
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_CALLER_NAME",
+        slot_data={
+            "appointment_day": "Tuesday",
+            "appointment_time": "3 pm",
+            "callback_number": "6784624453",
+        },
+    )
+    result = detect_and_respond("Jane Smith", BusinessContext(), session)
+    assert result.intent == "BOOK_APPOINTMENT"
+    assert result.state == "BOOKING_COMPLETE"
+    assert result.fields["caller_name"] == "Jane Smith"
+
+
+def test_fallback_mode_collects_caller_name_for_callback_requests(env_overrides):
+    session = SessionContext(
+        current_intent="CALLBACK_REQUEST",
+        current_state="COLLECTING_CALLER_NAME",
+        slot_data={"callback_number": "6784624453"},
+    )
+    result = detect_and_respond("My name is Maya", BusinessContext(), session)
+    assert result.intent == "CALLBACK_REQUEST"
+    assert result.state == "CALLBACK_READY"
+    assert result.fields["caller_name"] == "Maya"
+
+
 def test_detect_and_respond_empty_input_keeps_existing_state(env_overrides):
     session = SessionContext(current_state="COLLECTING_CALLBACK_NUMBER")
     result = detect_and_respond("", BusinessContext(), session)
@@ -77,7 +114,7 @@ def test_openai_structured_output_is_used(mock_openai):
     )
     result = detect_and_respond("Call me back at 6784624453")
     assert result.intent == "CALLBACK_REQUEST"
-    assert result.state == "CALLBACK_READY"
+    assert result.state == "COLLECTING_CALLER_NAME"
     assert result.fields["callback_number"] == "6784624453"
 
 
@@ -107,6 +144,39 @@ def test_openai_partial_json_gracefully_falls_back(mock_openai):
     result = detect_and_respond("Call me back")
     assert result.intent == "CALLBACK_REQUEST"
     assert result.state == "COLLECTING_CALLBACK_NUMBER"
+    assert result.response == "I can have someone call you back. What number should we use?"
+
+
+def test_openai_missing_intent_uses_safe_fallback_defaults(mock_openai):
+    mock_openai(content='{"state":"CALLBACK_READY","response":"Thanks.","fields":{"callback_number":"6784624453"}}')
+    result = detect_and_respond("Call me back")
+    assert result.intent == "CALLBACK_REQUEST"
+    assert result.state == "COLLECTING_CALLER_NAME"
+    assert result.response == "Thanks. What name should I put on that callback request?"
+
+
+def test_openai_invalid_intent_uses_safe_fallback_defaults(mock_openai):
+    mock_openai(content='{"intent":"SELL_INSURANCE","state":"GENERAL_ASSISTANCE","response":"Hello.","fields":{}}')
+    result = detect_and_respond("What are your hours?")
+    assert result.intent == "BUSINESS_HOURS"
+    assert result.response == "Our hours are Mon-Fri 9 AM to 5 PM."
+
+
+def test_openai_invalid_state_preserves_prior_valid_state(mock_openai):
+    mock_openai(content='{"intent":"BOOK_APPOINTMENT","state":"ALIEN_STATE","response":"What time works best for you?","fields":{"appointment_time":"3 pm"}}')
+    session = SessionContext(current_intent="BOOK_APPOINTMENT", current_state="COLLECTING_APPOINTMENT_TIME")
+    result = detect_and_respond("3 pm", BusinessContext(), session)
+    assert result.intent == "BOOK_APPOINTMENT"
+    assert result.state == "COLLECTING_APPOINTMENT_TIME"
+    assert result.response == "Sure, I can help schedule that. What day works for you?"
+
+
+def test_openai_missing_response_text_uses_safe_default_response(mock_openai):
+    mock_openai(content='{"intent":"BUSINESS_HOURS","state":"ANSWERED_BUSINESS_HOURS","response":"   ","fields":{}}')
+    result = detect_and_respond("What are your hours?")
+    assert result.intent == "BUSINESS_HOURS"
+    assert result.state == "ANSWERED_BUSINESS_HOURS"
+    assert result.response == "Our hours are Mon-Fri 9 AM to 5 PM."
 
 
 def test_openai_non_dict_fields_are_tolerated(mock_openai):
@@ -115,8 +185,23 @@ def test_openai_non_dict_fields_are_tolerated(mock_openai):
     )
     result = detect_and_respond("Call me back at 6784624453")
     assert result.intent == "CALLBACK_REQUEST"
-    assert result.state == "CALLBACK_READY"
+    assert result.state == "COLLECTING_CALLBACK_NUMBER"
     assert result.fields == {}
+
+
+def test_openai_unknown_fields_are_filtered(mock_openai):
+    mock_openai(
+        content='{"intent":"CALLBACK_REQUEST","state":"CALLBACK_READY","response":"Thanks.","fields":{"callback_number":"6784624453","foo":"bar"}}'
+    )
+    result = detect_and_respond("Call me back at 6784624453")
+    assert result.fields == {"callback_number": "6784624453"}
+
+
+def test_openai_timeout_gracefully_falls_back(mock_openai):
+    mock_openai(error=TimeoutError("timed out"))
+    result = detect_and_respond("What are your hours?")
+    assert result.intent == "BUSINESS_HOURS"
+    assert result.response.startswith("Our hours are")
 
 
 def test_business_context_influences_fallback_response(env_overrides):
@@ -130,9 +215,10 @@ def test_business_context_influences_fallback_response(env_overrides):
 
 def test_slot_extraction_and_alias_normalization_from_llm_output(mock_openai):
     mock_openai(
-        content='{"intent":"BOOK_APPOINTMENT","state":"COLLECTING_CALLBACK_NUMBER","response":"What callback number should we use?","fields":{"requested_time":"next Tuesday at 3 pm","phone_number":"6784624453"}}'
+        content='{"intent":"BOOK_APPOINTMENT","state":"COLLECTING_CALLER_NAME","response":"What name should I put on that request?","fields":{"requested_time":"next Tuesday at 3 pm","phone_number":"6784624453","name":"Jane"}}'
     )
     result = detect_and_respond("next Tuesday at 3 pm and 6784624453")
     assert result.fields["appointment_day"].lower() == "tuesday"
     assert result.fields["appointment_time"].lower() == "3 pm"
     assert result.fields["callback_number"] == "6784624453"
+    assert result.fields["caller_name"] == "Jane"

@@ -4,6 +4,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
+from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Gather, VoiceResponse
 
 from .ai import (
@@ -24,9 +25,9 @@ app = FastAPI(title="AI Receptionist MVP", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allowed_origin_list,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -54,6 +55,19 @@ def _normalize_phone_number(value: str | None) -> str:
     return digits
 
 
+def _normalize_business_numbers(
+    *,
+    twilio_number: str | None,
+    forwarding_number: str | None,
+) -> dict[str, str | None]:
+    normalized_twilio = _normalize_phone_number(twilio_number)
+    return {
+        "twilio_number": twilio_number.strip() if twilio_number else "",
+        "twilio_number_normalized": normalized_twilio or None,
+        "forwarding_number": forwarding_number.strip() if forwarding_number else None,
+    }
+
+
 def _log_voice(message: str) -> None:
     print(f"[voice] {message}", flush=True)
 
@@ -65,6 +79,9 @@ def _resolve_business(db: Session, to_number: str | None) -> Business | None:
 
     business = db.query(Business).filter(Business.twilio_number == to_number).first()
     if business:
+        normalized_target = _normalize_phone_number(to_number)
+        if normalized_target and business.twilio_number_normalized != normalized_target:
+            business.twilio_number_normalized = normalized_target
         _log_voice(
             f"business_lookup matched mode=exact to_number={to_number} business_id={business.id} business_name={business.name}"
         )
@@ -75,14 +92,19 @@ def _resolve_business(db: Session, to_number: str | None) -> Business | None:
         _log_voice(f"business_lookup skipped reason=empty_normalized_to_number raw_to_number={to_number}")
         return None
 
-    for candidate in db.query(Business).all():
-        if _normalize_phone_number(candidate.twilio_number) == normalized_target:
-            _log_voice(
-                "business_lookup matched "
-                f"mode=normalized to_number={to_number} normalized_to_number={normalized_target} "
-                f"business_id={candidate.id} business_name={candidate.name} stored_twilio_number={candidate.twilio_number}"
-            )
-            return candidate
+    business = (
+        db.query(Business)
+        .filter(Business.twilio_number_normalized == normalized_target)
+        .order_by(Business.id.asc())
+        .first()
+    )
+    if business:
+        _log_voice(
+            "business_lookup matched "
+            f"mode=normalized to_number={to_number} normalized_to_number={normalized_target} "
+            f"business_id={business.id} business_name={business.name} stored_twilio_number={business.twilio_number}"
+        )
+        return business
     _log_voice(f"business_lookup missed to_number={to_number} normalized_to_number={normalized_target}")
     return None
 
@@ -197,9 +219,9 @@ def _should_create_request(result_intent: str, result_state: str, slot_data: dic
     if slot_data.get("request_saved") == "true":
         return False
     if result_intent == "BOOK_APPOINTMENT" and result_state == "BOOKING_COMPLETE":
-        return True
+        return all(slot_data.get(key) for key in ("appointment_day", "appointment_time", "callback_number", "caller_name"))
     if result_intent == "CALLBACK_REQUEST" and result_state == "CALLBACK_READY":
-        return True
+        return all(slot_data.get(key) for key in ("callback_number", "caller_name"))
     return False
 
 
@@ -216,10 +238,70 @@ def _build_speech_safe_response(result_intent: str, result_state: str, response:
     return response
 
 
+def _get_silence_count(slot_data: dict[str, str]) -> int:
+    raw_value = slot_data.get("silence_count", "0")
+    try:
+        return max(0, int(raw_value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _clear_silence_count(slot_data: dict[str, str]) -> dict[str, str]:
+    updated = dict(slot_data)
+    updated.pop("silence_count", None)
+    return updated
+
+
+def _build_silence_response(silence_count: int) -> tuple[str, bool]:
+    if silence_count <= 1:
+        return ("Sorry, I didn't catch that. Please say that again.", False)
+    if silence_count == 2:
+        return ("I still didn't hear anything. Please tell me how I can help.", False)
+    return ("Thanks for calling. Goodbye.", True)
+
+
+def _build_voice_gather(prompt: str) -> Gather:
+    gather = Gather(
+        input="speech",
+        action="/voice",
+        method="POST",
+        speech_timeout="auto",
+        timeout=3,
+        action_on_empty_result=True,
+    )
+    if prompt:
+        gather.say(prompt)
+    return gather
+
+
+def _get_request_validation_url(request: Request) -> str:
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    query = f"?{request.url.query}" if request.url.query else ""
+    return f"{scheme}://{host}{request.url.path}{query}"
+
+
+def _is_valid_twilio_request(request: Request, form_data: dict[str, str | None]) -> bool:
+    if settings.disable_twilio_signature_validation:
+        return True
+
+    signature = request.headers.get("x-twilio-signature", "")
+    if not settings.twilio_auth_token or not signature:
+        return False
+
+    validator = RequestValidator(settings.twilio_auth_token)
+    params = {key: value or "" for key, value in form_data.items()}
+    return validator.validate(_get_request_validation_url(request), params, signature)
+
+
 @app.post("/voice")
 async def voice(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
     form_data = {key: form.get(key) for key in form.keys()}
+    if not _is_valid_twilio_request(request, form_data):
+        _log_voice("request_rejected reason=invalid_twilio_signature")
+        return Response(content="Forbidden", status_code=403, media_type="text/plain")
+
     _log_voice(
         "incoming_form "
         f"keys={sorted(form_data.keys())} "
@@ -246,28 +328,66 @@ async def voice(request: Request, db: Session = Depends(get_db)):
     response = VoiceResponse()
 
     if not speech:
-        gather = Gather(
-            input="speech",
-            action="/voice",
-            method="POST",
-            speech_timeout="auto",
-        )
-        gather.say(business_context.greeting)
+        merged_slot_data = dict(session_context.slot_data)
+
+        if session is None or not session_context.transcript:
+            prompt = business_context.greeting
+            merged_slot_data = _clear_silence_count(merged_slot_data)
+            gather = _build_voice_gather(prompt)
+            if session is not None:
+                session.transcript_json = json.dumps(
+                    _append_transcript(session_context.transcript, "assistant", prompt)
+                )
+                session.current_state = "GREETING_SENT"
+                session.slot_data_json = json.dumps(merged_slot_data)
+                session.is_active = True
+                db.commit()
+            response.append(gather)
+            return Response(content=str(response), media_type="application/xml")
+
+        silence_count = _get_silence_count(merged_slot_data) + 1
+        merged_slot_data["silence_count"] = str(silence_count)
+        prompt, should_end_call = _build_silence_response(silence_count)
+
         if session is not None:
             session.transcript_json = json.dumps(
-                _append_transcript(session_context.transcript, "assistant", business_context.greeting)
+                _append_transcript(session_context.transcript, "assistant", prompt)
             )
-            session.current_state = "GREETING_SENT"
-            session.is_active = True
-            db.commit()
-        response.append(gather)
-        response.redirect("/voice")
+            session.slot_data_json = json.dumps(merged_slot_data)
+            session.is_active = not should_end_call
+
+        log = CallLog(
+            business_id=business_context.id,
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            speech_input="",
+            ai_response=prompt,
+            call_status=call_status,
+            detected_intent=session_context.current_intent,
+            intent_data=json.dumps(
+                {
+                    "intent": session_context.current_intent,
+                    "state": session_context.current_state,
+                    "response": prompt,
+                    "fields": merged_slot_data,
+                }
+            ),
+        )
+        db.add(log)
+        db.commit()
+
+        response.say(prompt)
+        if should_end_call:
+            response.hangup()
+        else:
+            response.append(_build_voice_gather(""))
         return Response(content=str(response), media_type="application/xml")
 
     transcript = _append_transcript(session_context.transcript, "user", speech)
     session_context.transcript = transcript
     result = detect_and_respond(speech, business_context, session_context)
-    merged_slot_data = _merge_session_slots(session_context.slot_data, result.fields)
+    merged_slot_data = _clear_silence_count(_merge_session_slots(session_context.slot_data, result.fields))
     speech_safe_response = _build_speech_safe_response(
         result.intent,
         result.state,
@@ -279,7 +399,8 @@ async def voice(request: Request, db: Session = Depends(get_db)):
     if _should_create_request(result.intent, result.state, merged_slot_data):
         appointment = AppointmentRequest(
             business_id=business_context.id,
-            caller_phone=from_number,
+            caller_name=merged_slot_data.get("caller_name"),
+            caller_phone=merged_slot_data.get("callback_number") or from_number,
             requested_time=" ".join(
                 part
                 for part in (
@@ -318,14 +439,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
 
     response.say(speech_safe_response)
 
-    gather = Gather(
-        input="speech",
-        action="/voice",
-        method="POST",
-        speech_timeout="auto",
-    )
-    response.append(gather)
-    response.redirect("/voice")
+    response.append(_build_voice_gather(""))
     return Response(content=str(response), media_type="application/xml")
 
 
@@ -348,10 +462,15 @@ def get_settings(db: Session = Depends(get_db)):
 
 @app.post("/api/businesses", response_model=BusinessOut)
 def create_business(payload: BusinessCreate, db: Session = Depends(get_db)):
-    row = Business(
-        name=payload.name,
+    number_fields = _normalize_business_numbers(
         twilio_number=payload.twilio_number,
         forwarding_number=payload.forwarding_number,
+    )
+    row = Business(
+        name=payload.name,
+        twilio_number=number_fields["twilio_number"],
+        twilio_number_normalized=number_fields["twilio_number_normalized"],
+        forwarding_number=number_fields["forwarding_number"],
         greeting=payload.greeting or settings.business_greeting,
         business_hours=payload.business_hours or settings.business_hours,
         booking_enabled=payload.booking_enabled,
@@ -378,10 +497,15 @@ def create_demo_business(
     if existing:
         return existing
 
-    row = Business(
-        name=settings.business_name,
+    number_fields = _normalize_business_numbers(
         twilio_number=twilio_number,
         forwarding_number=forwarding_number,
+    )
+    row = Business(
+        name=settings.business_name,
+        twilio_number=number_fields["twilio_number"],
+        twilio_number_normalized=number_fields["twilio_number_normalized"],
+        forwarding_number=number_fields["forwarding_number"],
         greeting=settings.business_greeting,
         business_hours=settings.business_hours,
         booking_enabled=settings.booking_enabled,

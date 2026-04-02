@@ -12,6 +12,7 @@ At a high level:
 - SQLite stores business records, call logs, appointment requests, and per-call session state.
 - OpenAI is used to generate structured receptionist responses when an API key is configured.
 - A fallback rule-based path is used when the API key is missing or the model output is unusable.
+- Twilio signatures are validated on `/voice` by default before any session or DB work happens.
 
 The backend is intentionally small. Most logic lives in:
 
@@ -30,9 +31,16 @@ Flow:
 
 1. A caller dials a Twilio phone number.
 2. Twilio sends an HTTP request to the configured voice webhook.
-3. The backend responds with TwiML XML.
-4. Twilio reads the response aloud and captures follow-up speech using `Gather`.
-5. Twilio sends the next turn back to `/voice`.
+3. The backend validates the Twilio signature.
+4. The backend responds with TwiML XML.
+5. Twilio reads the response aloud and captures follow-up speech using `Gather`.
+6. Twilio sends the next turn back to `/voice`.
+
+All `Gather` usage in the current backend is configured with:
+
+- `speech_timeout="auto"`
+- `timeout=3`
+- `action_on_empty_result=True`
 
 The backend is therefore a webhook-driven state machine.
 
@@ -92,6 +100,14 @@ When the key is missing, or the model output is invalid, the backend falls back 
 
 This design keeps the system usable offline or in partial-failure scenarios.
 
+### CORS Configuration
+
+CORS is configured from `backend/app/config.py` through a comma-separated env value:
+
+- `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000`
+
+The default is local-only. The backend no longer ships with wildcard CORS enabled.
+
 ## 2. Call Flow Lifecycle
 
 This is the main request path through `POST /voice`.
@@ -106,6 +122,19 @@ Twilio sends form-encoded data to `/voice`, typically including:
 - `CallStatus`
 - `SpeechResult` for spoken turns
 
+Before the request is processed, the backend validates `X-Twilio-Signature` using the configured Twilio auth token.
+
+If validation fails:
+
+- the request returns HTTP `403`
+- no session is created
+- no call log is written
+- no TwiML is generated
+
+For local development, signature validation can be disabled explicitly with:
+
+- `DISABLE_TWILIO_SIGNATURE_VALIDATION=true`
+
 ### Step 2: Business Lookup
 
 The backend resolves the business using the incoming Twilio `To` number.
@@ -113,7 +142,7 @@ The backend resolves the business using the incoming Twilio `To` number.
 Behavior:
 
 - exact match against `businesses.twilio_number`
-- normalized digit-only fallback match
+- indexed normalized match against `businesses.twilio_number_normalized`
 - env-backed default business config if no business row matches
 
 This supports basic multi-tenant routing by Twilio number.
@@ -139,9 +168,12 @@ This is passed to the AI layer.
 
 If `SpeechResult` is empty:
 
-- the backend returns a `Gather`
-- the configured greeting is spoken
-- the session transcript is updated with the assistant greeting
+- on the first request for a call, the configured greeting is spoken and a `Gather` is returned
+- on later silent turns, the backend increments a small silence counter in session slot data
+- first silent turn after greeting or prompting: polite reprompt
+- second silent turn: shorter fallback prompt
+- third silent turn: clean goodbye and hangup
+- silence turns are handled directly in `/voice` without redirect loops
 
 If `SpeechResult` is present:
 
@@ -176,8 +208,13 @@ Examples:
 - `appointment_day`
 - `appointment_time`
 - `callback_number`
+- `caller_name`
 
 The assistant reply is appended to transcript and the session row is updated.
+
+Silence tracking also lives in slot storage through:
+
+- `silence_count`
 
 ### Step 8: DB Logging
 
@@ -185,8 +222,8 @@ Each spoken turn is logged into `call_logs`.
 
 Depending on the state:
 
-- booking completion may create an `appointment_requests` row
-- callback-ready may create an `appointment_requests` row used as a simple follow-up request
+- booking completion creates an `appointment_requests` row only after `appointment_day`, `appointment_time`, `callback_number`, and `caller_name` are all present
+- callback completion creates an `appointment_requests` row only after `callback_number` and `caller_name` are present
 
 ### Step 9: TwiML Response Returned to Twilio
 
@@ -194,9 +231,9 @@ The backend returns TwiML with:
 
 - `Say`
 - another `Gather`
-- a `Redirect` back to `/voice`
+- or `Hangup` when repeated silence exceeds the threshold
 
-This keeps the conversation open for the next caller turn.
+This keeps the conversation open for the next caller turn while still ending deterministically after repeated silence.
 
 ## 3. Conversation State Model
 
@@ -240,6 +277,8 @@ Typical keys:
 - `appointment_day`
 - `appointment_time`
 - `callback_number`
+- `caller_name`
+- `silence_count`
 - `request_saved`
 
 ### State Machine Behavior
@@ -251,6 +290,7 @@ The current state is persisted explicitly. Common states include:
 - `COLLECTING_APPOINTMENT_DAY`
 - `COLLECTING_APPOINTMENT_TIME`
 - `COLLECTING_CALLBACK_NUMBER`
+- `COLLECTING_CALLER_NAME`
 - `BOOKING_COMPLETE`
 - `CALLBACK_READY`
 - `ANSWERED_BUSINESS_HOURS`
@@ -271,6 +311,7 @@ Expected behavior:
 - collect `appointment_day`
 - collect `appointment_time`
 - collect `callback_number`
+- collect `caller_name`
 - create an appointment request when complete
 
 ### `BUSINESS_HOURS`
@@ -289,6 +330,7 @@ Used when the caller wants someone to call them back.
 Expected behavior:
 
 - collect `callback_number`
+- collect `caller_name`
 - confirm in speech-safe format
 - create a simple request record when ready
 
@@ -320,12 +362,38 @@ The LLM is prompted to return JSON only in this shape:
 
 This keeps the backend in control of persistence and state transitions.
 
+### Validation and Sanitization Layer
+
+The backend does not trust raw model output.
+
+Before the `/voice` route uses any LLM result, `backend/app/ai.py` normalizes it into a safe shape:
+
+```json
+{
+  "intent": "...",
+  "state": "...",
+  "response": "...",
+  "fields": {}
+}
+```
+
+Validation rules:
+
+- `intent` must be one of the known intent constants
+- `state` must be a known safe state string, otherwise the prior valid session state is preserved when possible
+- semantically premature states like `BOOKING_COMPLETE` or `CALLBACK_READY` are downgraded to the next safe collection state if required slots are still missing
+- `response` must be non-empty and is sanitized into short phone-friendly text
+- `fields` must be a dictionary and are filtered down to known slot keys
+
+If the model returns malformed JSON, empty content, missing fields, invalid intent/state values, or an unusable payload, the backend falls back to a deterministic safe response instead of exposing raw model output to the Twilio flow.
+
 ### Fallback Mode
 
 Fallback mode is used when:
 
 - `OPENAI_API_KEY` is missing
 - the OpenAI call raises an exception
+- the OpenAI call times out
 - the model returns empty output
 - the model returns malformed or incomplete JSON
 
@@ -350,6 +418,8 @@ For matching Twilio numbers to business records:
 - strips formatting
 - keeps only digits
 - drops leading US `1` if present on 11-digit numbers
+- stores the normalized value in `businesses.twilio_number_normalized`
+- resolves businesses through an indexed normalized lookup instead of scanning all rows
 
 This helps match:
 
@@ -418,6 +488,9 @@ backend/app
 The suite currently exercises:
 
 - route behavior
+- Twilio signature validation
+- CORS behavior for allowed and disallowed origins
+- empty-gather silence handling and repeated-silence hangup behavior
 - DB writes
 - session persistence
 - fallback logic
@@ -436,6 +509,14 @@ pip install -r requirements.txt
 cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
+
+Important local env vars:
+
+- `TWILIO_AUTH_TOKEN`
+- `DISABLE_TWILIO_SIGNATURE_VALIDATION`
+- `CORS_ALLOWED_ORIGINS`
+- `OPENAI_API_KEY`
+- `DATABASE_URL`
 
 ### Frontend
 
@@ -493,6 +574,7 @@ Possible next steps:
 - admin auth
 - business-specific dashboards
 - per-business routing and permissions
+- automatic phone-number normalization at input boundaries beyond the current create routes
 - tenant-aware analytics
 
 ### Calendar Integration

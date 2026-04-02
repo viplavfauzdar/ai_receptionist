@@ -4,6 +4,8 @@ Twilio + FastAPI backend with:
 - OpenAI response generation
 - structured intent detection
 - basic multi-tenant business lookup
+- Twilio signature validation
+- config-driven CORS
 - persistent per-call session state
 - SQLite logging via SQLAlchemy
 - basic appointment capture
@@ -39,6 +41,7 @@ Runtime responsibilities:
 - The AI layer returns structured receptionist results with `intent`, `state`, `response`, and `fields`.
 - SQLite stores businesses, call logs, appointment requests, and call sessions.
 - OpenAI generates the receptionist response when `OPENAI_API_KEY` is configured; otherwise the app uses fallback logic.
+- `/voice` validates the Twilio signature by default before processing the webhook.
 
 Code locations:
 - Twilio webhook and TwiML generation: [`backend/app/main.py`](backend/app/main.py)
@@ -48,13 +51,14 @@ Code locations:
 
 Multi-business resolution:
 - The backend checks the incoming Twilio `To` number on `POST /voice`.
+- Business phone numbers are normalized into a digit-only lookup field and resolved through an indexed query instead of a table scan.
 - If a `businesses` row matches that number, the app uses that business's `greeting`, `business_hours`, `booking_enabled`, and `knowledge_text`.
 - If no row matches, the app falls back to the env-backed defaults from `backend/app/config.py`.
 
 Session state:
 - Each Twilio call is keyed by `CallSid` in the `call_sessions` table.
 - On each `POST /voice`, the backend loads or creates the session, appends the latest user utterance, calls the AI layer with the existing session context, and saves the assistant reply plus updated session state.
-- `slot_data_json` stores collected values such as `appointment_day`, `appointment_time`, and `callback_number`.
+- `slot_data_json` stores collected values such as `appointment_day`, `appointment_time`, `callback_number`, and `caller_name`.
 - `transcript_json` stores the recent call transcript so booking flows can continue across turns.
 
 ## 1) Backend setup
@@ -73,6 +77,9 @@ For LLM mode, edit `backend/.env` before starting the server and set a real Open
 ```env
 OPENAI_API_KEY=your_real_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
+TWILIO_AUTH_TOKEN=your_real_twilio_auth_token
+DISABLE_TWILIO_SIGNATURE_VALIDATION=false
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 BUSINESS_NAME=Bright Smile Dental
 BUSINESS_GREETING=Hello, thanks for calling Bright Smile Dental. How can I help you today?
 BUSINESS_HOURS=Mon-Fri 9 AM to 5 PM
@@ -96,6 +103,10 @@ Behavior:
 - If `OPENAI_API_KEY` is missing or the OpenAI request fails, the backend falls back to simple rule-based intent detection and short canned replies.
 - Business profile data is resolved from the `businesses` table first, with `.env` fallback defaults when no business row matches.
 - The `state` value is persisted so the next `/voice` turn can continue from the prior step instead of restarting.
+- Model output is validated and sanitized before the `/voice` route uses it, so malformed JSON, missing fields, invalid intent/state values, empty content, and timeout/error cases all recover to a safe fallback response instead of breaking the Twilio flow.
+- The backend validates the `X-Twilio-Signature` header by default. For local development behind `ngrok`, you can temporarily set `DISABLE_TWILIO_SIGNATURE_VALIDATION=true`.
+- CORS is restricted by `CORS_ALLOWED_ORIGINS`; the default allows only local frontend origins.
+- Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
 
 ## 2) Expose locally to Twilio
 
@@ -129,6 +140,9 @@ Open:
 Backend `.env`:
 - `OPENAI_API_KEY` required for real LLM mode
 - `OPENAI_MODEL=gpt-4o-mini`
+- `TWILIO_AUTH_TOKEN` required for production webhook validation
+- `DISABLE_TWILIO_SIGNATURE_VALIDATION=false`
+- `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000`
 - `BUSINESS_NAME=Bright Smile Dental`
 - `BUSINESS_GREETING=Hello, thanks for calling Bright Smile Dental. How can I help you today?`
 - `BUSINESS_HOURS=Mon-Fri 9 AM to 5 PM`
@@ -142,16 +156,21 @@ Frontend `.env.local`:
 
 - This MVP uses SQLite at `backend/receptionist.db`.
 - Multi-tenant mode is basic: one incoming Twilio number maps to one business record.
+- Business lookup is normalized and indexed through `businesses.twilio_number_normalized`.
 - Call sessions are persisted locally in SQLite and keyed by `CallSid`.
 - Business names, greetings, hours, booking settings, and knowledge text are stored in the database, with env-backed fallback defaults if no business matches.
-- Appointment booking is intentionally simple: it captures requested time and caller info.
+- Appointment booking is intentionally simple: it only persists when the flow is complete enough to save.
+- Booking requests are saved only after `appointment_day`, `appointment_time`, `callback_number`, and `caller_name` are present.
+- Callback requests are saved only after `callback_number` and `caller_name` are present.
 - The Twilio voice webhook contract remains `POST /voice`.
 - The receptionist is LLM-first when `OPENAI_API_KEY` is configured.
 - Booking and callback intents create a simple database entry in `appointment_requests`.
 - Call logs store `business_id`, `detected_intent`, and structured `intent_data`.
 - Appointment requests now store `business_id`.
+- The receptionist now asks for caller name before finalizing a booking or callback request.
 - For production, replace SQLite with Postgres and add real calendar integration.
-- Twilio Gather speech handling is implemented in `/voice`.
+- Twilio Gather speech handling is implemented in `/voice` with `speech_timeout="auto"`, `timeout=3`, and `action_on_empty_result=True`.
+- Silent turns are tracked in session slot data with a small `silence_count` so the call does not fall into redirect loops.
 
 Example 3-turn booking flow:
 1. Caller: `I want to book an appointment`
@@ -161,7 +180,10 @@ Example 3-turn booking flow:
    Assistant: `What time works best for you?`
    Session state: `COLLECTING_APPOINTMENT_TIME`
 3. Caller: `3 pm, and my number is 555-111-2222`
-   Assistant: `Thanks. I have your day, time, and callback number. We will follow up shortly.`
+   Assistant: `What name should I put on that request?`
+   Session state: `COLLECTING_CALLER_NAME`
+4. Caller: `Jane Smith`
+   Assistant: `Thanks. I have your day, time, and callback number as 5 5 5, 1 1 1, 2 2 2 2. We will follow up shortly.`
    Session state: `BOOKING_COMPLETE`
 
 ## 6) Create A Demo Business
@@ -196,7 +218,6 @@ curl -X POST http://127.0.0.1:8000/api/businesses \
 - Google Calendar integration
 - Stripe billing
 - multi-tenant business configs
-- Twilio request validation
 - role-based auth
 
 ## 8) Backend Tests

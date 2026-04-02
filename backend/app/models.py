@@ -9,6 +9,7 @@ class Business(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
     twilio_number = Column(String(64), index=True, nullable=False)
+    twilio_number_normalized = Column(String(32), index=True, nullable=True)
     forwarding_number = Column(String(64), nullable=True)
     greeting = Column(Text, nullable=True)
     business_hours = Column(String(255), nullable=True)

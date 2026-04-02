@@ -13,6 +13,20 @@ INTENTS = {
     "GENERAL_QUESTION",
 }
 
+SAFE_STATES = {
+    "NEW",
+    "GREETING_SENT",
+    "COLLECTING_APPOINTMENT_DAY",
+    "COLLECTING_APPOINTMENT_TIME",
+    "COLLECTING_CALLBACK_NUMBER",
+    "COLLECTING_CALLER_NAME",
+    "BOOKING_COMPLETE",
+    "CALLBACK_READY",
+    "ANSWERED_BUSINESS_HOURS",
+    "GENERAL_ASSISTANCE",
+    "CALLBACK_REQUEST",
+}
+
 
 def _log_ai_mode(message: str) -> None:
     print(f"[ai] {message}", flush=True)
@@ -60,6 +74,20 @@ def _get_client() -> OpenAI | None:
 def _extract_phone_number(user_input: str) -> str | None:
     match = re.search(r"(\+?\d[\d\-\(\) ]{7,}\d)", user_input)
     return match.group(1).strip() if match else None
+
+
+def _extract_caller_name(user_input: str) -> str | None:
+    patterns = [
+        r"\bmy name is ([A-Za-z][A-Za-z' -]{0,48})\b",
+        r"\bthis is ([A-Za-z][A-Za-z' -]{0,48})\b",
+        r"\bi am ([A-Za-z][A-Za-z' -]{0,48})\b",
+        r"\bi'm ([A-Za-z][A-Za-z' -]{0,48})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, user_input, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" .,!?:;")
+    return None
 
 
 def format_phone_number_for_speech(phone_number: str) -> str:
@@ -142,16 +170,21 @@ def _build_booking_response(slot_data: dict[str, str], business: BusinessContext
 
     missing_fields = [
         field_name
-        for field_name in ("appointment_day", "appointment_time", "callback_number")
+        for field_name in ("appointment_day", "appointment_time", "callback_number", "caller_name")
         if not slot_data.get(field_name)
     ]
     if not missing_fields:
-        return ("BOOKING_COMPLETE", "Thanks. I have your day, time, and callback number. We will follow up shortly.")
+        return (
+            "BOOKING_COMPLETE",
+            "Thanks. I have your day, time, callback number, and name. We will follow up shortly.",
+        )
     if missing_fields[0] == "appointment_day":
         return ("COLLECTING_APPOINTMENT_DAY", "Sure, I can help schedule that. What day works for you?")
     if missing_fields[0] == "appointment_time":
         return ("COLLECTING_APPOINTMENT_TIME", "What time works best for you?")
-    return ("COLLECTING_CALLBACK_NUMBER", "What callback number should we use?")
+    if missing_fields[0] == "callback_number":
+        return ("COLLECTING_CALLBACK_NUMBER", "What callback number should we use?")
+    return ("COLLECTING_CALLER_NAME", "What name should I put on that request?")
 
 
 def _normalize_fields(fields: dict[str, str]) -> dict[str, str]:
@@ -172,12 +205,84 @@ def _normalize_fields(fields: dict[str, str]) -> dict[str, str]:
         "time": "appointment_time",
         "phone_number": "callback_number",
         "caller_phone": "callback_number",
+        "name": "caller_name",
+        "customer_name": "caller_name",
     }
     for source_key, target_key in alias_map.items():
         if source_key in normalized and target_key not in normalized:
             normalized[target_key] = normalized[source_key]
 
-    return normalized
+    allowed_keys = {"appointment_day", "appointment_time", "callback_number", "caller_name"}
+    cleaned = {key: value.strip() for key, value in normalized.items() if key in allowed_keys and value.strip()}
+    return cleaned
+
+
+def _default_state_for_intent(intent: str, business: BusinessContext, slot_data: dict[str, str]) -> str:
+    if intent == "BOOK_APPOINTMENT":
+        state, _ = _build_booking_response(slot_data, business)
+        return state
+    if intent == "BUSINESS_HOURS":
+        return "ANSWERED_BUSINESS_HOURS"
+    if intent == "CALLBACK_REQUEST":
+        if not slot_data.get("callback_number"):
+            return "COLLECTING_CALLBACK_NUMBER"
+        if not slot_data.get("caller_name"):
+            return "COLLECTING_CALLER_NAME"
+        return "CALLBACK_READY"
+    return "GENERAL_ASSISTANCE"
+
+
+def _default_response_for_intent(intent: str, business: BusinessContext, slot_data: dict[str, str]) -> str:
+    if intent == "BOOK_APPOINTMENT":
+        _, response = _build_booking_response(slot_data, business)
+        return response
+    if intent == "BUSINESS_HOURS":
+        return f"Our hours are {business.business_hours}."
+    if intent == "CALLBACK_REQUEST":
+        if slot_data.get("callback_number") and slot_data.get("caller_name"):
+            return "Thanks. We can follow up at that number."
+        if slot_data.get("callback_number"):
+            return "Thanks. What name should I put on that callback request?"
+        return "I can have someone call you back. What number should we use?"
+    return "Thanks for calling. How can I help you today?"
+
+
+def _normalize_intent(intent: object) -> str | None:
+    if not isinstance(intent, str):
+        return None
+    normalized = intent.strip().upper()
+    if normalized in INTENTS:
+        return normalized
+    return None
+
+
+def _normalize_state(state: object, session: SessionContext, intent: str, business: BusinessContext, slot_data: dict[str, str]) -> str:
+    if isinstance(state, str):
+        cleaned = state.strip().upper()
+        if cleaned in SAFE_STATES:
+            if cleaned == "BOOKING_COMPLETE" and not all(
+                slot_data.get(key) for key in ("appointment_day", "appointment_time", "callback_number", "caller_name")
+            ):
+                return _default_state_for_intent(intent, business, slot_data)
+            if cleaned == "CALLBACK_READY" and not all(slot_data.get(key) for key in ("callback_number", "caller_name")):
+                return _default_state_for_intent(intent, business, slot_data)
+            return cleaned
+    if session.current_state in SAFE_STATES and session.current_state not in {"NEW", "GREETING_SENT"}:
+        return session.current_state
+    return _default_state_for_intent(intent, business, slot_data)
+
+
+def _sanitize_response_text(response: object) -> str:
+    if not isinstance(response, str):
+        return ""
+    cleaned = " ".join(response.split()).strip()
+    if not cleaned:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    cleaned = " ".join(sentences[:2]).strip()
+    if len(cleaned) > 220:
+        cleaned = cleaned[:217].rstrip(" ,;:-") + "..."
+    return cleaned
 
 
 def _fallback_result(
@@ -196,6 +301,12 @@ def _fallback_result(
     phone_number = _extract_phone_number(user_input)
     appointment_day = _extract_appointment_day(user_input)
     appointment_time = _extract_appointment_time(user_input)
+    caller_name = _extract_caller_name(user_input)
+    stripped_input = user_input.strip(" .,!?:;")
+
+    if not caller_name and session.current_state == "COLLECTING_CALLER_NAME":
+        if stripped_input and re.fullmatch(r"[A-Za-z][A-Za-z' -]{0,48}", stripped_input):
+            caller_name = stripped_input
 
     if intent == "BOOK_APPOINTMENT":
         if appointment_day:
@@ -204,6 +315,8 @@ def _fallback_result(
             fields["appointment_time"] = appointment_time
         if phone_number:
             fields["callback_number"] = phone_number
+        if caller_name:
+            fields["caller_name"] = caller_name
         merged_slots = _merge_slot_data(session.slot_data, fields)
         state, response = _build_booking_response(merged_slots, business)
         return ReceptionistResult(intent=intent, state=state, response=response, fields=fields)
@@ -219,10 +332,15 @@ def _fallback_result(
     if intent == "CALLBACK_REQUEST":
         if phone_number:
             fields["callback_number"] = phone_number
+        if caller_name:
+            fields["caller_name"] = caller_name
         merged_slots = _merge_slot_data(session.slot_data, fields)
-        if merged_slots.get("callback_number"):
+        if merged_slots.get("callback_number") and merged_slots.get("caller_name"):
             state = "CALLBACK_READY"
             response = "Thanks. We can follow up at that number."
+        elif merged_slots.get("callback_number"):
+            state = "COLLECTING_CALLER_NAME"
+            response = "Thanks. What name should I put on that callback request?"
         else:
             state = "COLLECTING_CALLBACK_NUMBER"
             response = "I can have someone call you back. What number should we use?"
@@ -257,10 +375,10 @@ def _system_prompt(business: BusinessContext, session: SessionContext) -> str:
         f"Recent transcript is {transcript_tail}. "
         f"{knowledge_section}"
         "For BOOK_APPOINTMENT, use and preserve collected slots across turns. "
-        "Collect appointment_day, appointment_time, and callback_number until complete. "
-        "Use state values like COLLECTING_APPOINTMENT_DAY, COLLECTING_APPOINTMENT_TIME, COLLECTING_CALLBACK_NUMBER, or BOOKING_COMPLETE. "
+        "Collect appointment_day, appointment_time, callback_number, and caller_name until complete. "
+        "Use state values like COLLECTING_APPOINTMENT_DAY, COLLECTING_APPOINTMENT_TIME, COLLECTING_CALLBACK_NUMBER, COLLECTING_CALLER_NAME, or BOOKING_COMPLETE. "
         "For BUSINESS_HOURS, answer directly with the hours. "
-        "For CALLBACK_REQUEST, ask for a callback number if missing and use states like COLLECTING_CALLBACK_NUMBER or CALLBACK_READY. "
+        "For CALLBACK_REQUEST, ask for a callback number if missing, then ask for the caller's name if missing, and use states like COLLECTING_CALLBACK_NUMBER, COLLECTING_CALLER_NAME, or CALLBACK_READY. "
         "Treat phone numbers as digit strings, never as numeric quantities. "
         "If you mention a phone number, keep it as digits and do not spell it as a large number. "
         "For GENERAL_QUESTION, use GENERAL_ASSISTANCE. "
@@ -277,28 +395,29 @@ def _coerce_result(
     if not isinstance(payload, dict):
         return _fallback_result(user_input, business, session)
 
-    intent = payload.get("intent")
-    state = payload.get("state")
-    response = payload.get("response")
-    fields = payload.get("fields")
+    fallback = _fallback_result(user_input, business, session)
 
-    if (
-        intent not in INTENTS
-        or not isinstance(state, str)
-        or not state.strip()
-        or not isinstance(response, str)
-        or not response.strip()
-    ):
-        return _fallback_result(user_input, business, session)
+    normalized_intent = _normalize_intent(payload.get("intent"))
+    intent = normalized_intent or fallback.intent
+    fields = payload.get("fields")
 
     if not isinstance(fields, dict):
         fields = {}
 
     clean_fields = _normalize_fields({str(key): str(value) for key, value in fields.items() if value is not None})
+    merged_slots = _merge_slot_data(session.slot_data, clean_fields)
+    raw_state = payload.get("state")
+    state = _normalize_state(raw_state, session, intent, business, merged_slots)
+    response = _sanitize_response_text(payload.get("response"))
+    state_valid = isinstance(raw_state, str) and raw_state.strip().upper() in SAFE_STATES
+
+    if not normalized_intent or not state_valid or not response:
+        response = _default_response_for_intent(intent, business, merged_slots)
+
     return ReceptionistResult(
         intent=intent,
-        state=state.strip(),
-        response=" ".join(response.split()),
+        state=state,
+        response=response,
         fields=clean_fields,
     )
 
@@ -329,6 +448,7 @@ def detect_and_respond(
         response = client.chat.completions.create(
             model=settings.openai_model,
             response_format={"type": "json_object"},
+            timeout=10.0,
             messages=[
                 {"role": "system", "content": _system_prompt(business, session)},
                 {"role": "user", "content": user_input},

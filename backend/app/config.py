@@ -4,6 +4,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    twilio_auth_token: str = ""
+    disable_twilio_signature_validation: bool = False
+    cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     database_url: str = "sqlite:///./receptionist.db"
     business_name: str = "Bright Smile Dental"
     business_greeting: str = "Hello, thanks for calling Bright Smile Dental. How can I help you today?"
@@ -11,6 +14,14 @@ class Settings(BaseSettings):
     booking_enabled: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @property
+    def cors_allowed_origin_list(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.cors_allowed_origins.split(",")
+            if origin.strip()
+        ]
 
 
 settings = Settings()

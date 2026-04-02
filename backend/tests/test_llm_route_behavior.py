@@ -61,3 +61,95 @@ def test_voice_route_falls_back_when_llm_returns_malformed_json(client, mock_ope
 
     assert res.status_code == 200
     assert "What number should we use?" in res.text
+
+
+def test_voice_route_returns_200_when_llm_json_is_missing_intent(client, mock_openai):
+    mock_openai(content='{"state":"CALLBACK_READY","response":"Thanks.","fields":{"callback_number":"6784624453"}}')
+
+    res = client.post(
+        "/voice",
+        data={
+            "CallSid": "CA-llm-missing-intent",
+            "From": "+15551230000",
+            "To": "+15557654321",
+            "CallStatus": "in-progress",
+            "SpeechResult": "Call me back at 6784624453",
+        },
+    )
+
+    assert res.status_code == 200
+    assert "What name should I put on that callback request?" in res.text
+
+
+def test_voice_route_returns_200_when_llm_json_has_invalid_intent(client, mock_openai):
+    mock_openai(content='{"intent":"BAD_INTENT","state":"GENERAL_ASSISTANCE","response":"Hello.","fields":{}}')
+
+    res = client.post(
+        "/voice",
+        data={
+            "CallSid": "CA-llm-invalid-intent",
+            "From": "+15551230000",
+            "To": "+15557654321",
+            "CallStatus": "in-progress",
+            "SpeechResult": "What are your hours?",
+        },
+    )
+
+    assert res.status_code == 200
+    assert "Our hours are" in res.text
+
+
+def test_voice_route_returns_200_when_llm_json_has_invalid_state(client, mock_openai):
+    mock_openai(
+        content='{"intent":"CALLBACK_REQUEST","state":"BROKEN_STATE","response":"Thanks.","fields":{"callback_number":"6784624453"}}'
+    )
+
+    res = client.post(
+        "/voice",
+        data={
+            "CallSid": "CA-llm-invalid-state",
+            "From": "+15551230000",
+            "To": "+15557654321",
+            "CallStatus": "in-progress",
+            "SpeechResult": "Call me back at 6784624453",
+        },
+    )
+
+    assert res.status_code == 200
+    assert "What name should I put on that callback request?" in res.text
+
+
+def test_voice_route_returns_200_when_llm_json_has_missing_response(client, mock_openai):
+    mock_openai(content='{"intent":"BUSINESS_HOURS","state":"ANSWERED_BUSINESS_HOURS","fields":{}}')
+
+    res = client.post(
+        "/voice",
+        data={
+            "CallSid": "CA-llm-missing-response",
+            "From": "+15551230000",
+            "To": "+15557654321",
+            "CallStatus": "in-progress",
+            "SpeechResult": "What are your hours?",
+        },
+    )
+
+    assert res.status_code == 200
+    assert "Our hours are" in res.text
+
+
+def test_voice_route_returns_200_when_llm_times_out(client, mock_openai):
+    mock_openai(error=TimeoutError("timed out"))
+
+    res = client.post(
+        "/voice",
+        data={
+            "CallSid": "CA-llm-timeout",
+            "From": "+15551230000",
+            "To": "+15557654321",
+            "CallStatus": "in-progress",
+            "SpeechResult": "What are your hours?",
+        },
+    )
+
+    assert res.status_code == 200
+    assert "Our hours are" in res.text
