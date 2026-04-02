@@ -62,6 +62,8 @@ Frontend expects `.env.local` with:
 
 Do not hardcode secrets. Keep environment access centralized in `backend/app/config.py` when backend config changes are needed.
 
+- If a new environment variable is introduced, update all three of: `backend/app/config.py`, `.env.example`, and `README.md` in the same change.
+
 ## Backend Guidance
 
 - Keep the ASGI app in `backend/app/main.py`.
@@ -85,8 +87,10 @@ Do not hardcode secrets. Keep environment access centralized in `backend/app/con
 Minimum verification after changes:
 
 - backend starts with `uvicorn app.main:app --reload --port 8000`
-- `GET /` and `GET /health` respond successfully
-- frontend builds or runs if frontend files were changed
+- backend tests pass with `python -m pytest backend/tests`
+- `GET /health` responds successfully
+- `POST /voice` returns valid TwiML for an empty speech request
+- if frontend files were changed, frontend builds or runs successfully
 
 If a change affects Twilio flow, verify:
 
@@ -102,8 +106,70 @@ If a change affects Twilio flow, verify:
 - Document any new env vars in `README.md`.
 - If a change affects system architecture, call flow, persistence, state handling, integration boundaries, or other developer-facing backend design, update `ARCHITECTURE.md` in the same change.
 
-## Known Project Constraints
+## Agent Operating Rules
 
-- Persistence is currently SQLite, stored at `backend/receptionist.db`.
-- Appointment capture is intentionally basic.
-- Production-grade concerns like auth, Twilio signature validation, and calendar integration are not implemented yet.
+- Read `AGENTS.md` before making changes.
+- Prefer the smallest patch that fully solves the task.
+- Preserve existing route names, request shapes, and response contracts unless explicitly asked to change them.
+- If you change backend architecture, persistence, call flow, integrations, or state handling, update `ARCHITECTURE.md` in the same change.
+- If you add a new dependency, justify it by necessity and keep the dependency count minimal.
+- Before finishing, verify changed code paths with tests or a concrete local run command.
+- Never silently degrade behavior; if a tradeoff is required, document it in `README.md` or `ARCHITECTURE.md`.
+
+## Telephony Integration Notes
+
+- Twilio voice webhooks must continue to use `POST /voice` unless explicitly changed.
+- Responses to Twilio must always return valid TwiML.
+- If modifying the call flow, preserve:
+  - initial greeting
+  - speech gather step
+  - deterministic response generation
+- Do not introduce blocking operations in the Twilio request path.
+
+## AI And Prompting Rules
+
+- Keep voice responses short, clear, and phone-friendly.
+- Do not return long paragraphs for spoken responses.
+- Prefer structured AI outputs when downstream logic depends on intents, slots, state, or external actions.
+- Validate model output before using it in route handlers.
+- Always provide a safe fallback path when external AI calls fail or return malformed data.
+- Deterministic logic such as phone-number formatting, date normalization, validation, and persistence rules should live in code, not only in prompts.
+
+## Database Changes
+
+- All schema changes must be applied through SQLAlchemy models in `backend/app/models.py`.
+- Maintain compatibility with the existing SQLite database at `backend/receptionist.db`.
+- Prefer additive schema changes rather than destructive ones.
+- If new fields are added, ensure existing rows remain valid.
+
+## External Integrations
+
+When adding integrations (for example Google Calendar or other APIs):
+
+- Place integration logic in a dedicated service module inside `backend/app/`.
+- Avoid placing external API logic directly in route handlers.
+- Handle failures gracefully so that calls do not crash the Twilio flow.
+- Persist any external identifiers (for example calendar event IDs) in the database.
+
+## Reliability And Performance
+
+- Protect Twilio request handling from slow or brittle external calls.
+- Keep the request path resilient: handle timeouts, malformed responses, and third-party failures gracefully.
+- Avoid unnecessary blocking work inside the `/voice` request path.
+- When an external dependency fails, prefer preserving the caller workflow and saving a recoverable record rather than dropping the call.
+
+## Documentation Expectations
+
+- `README.md` should contain setup and run instructions.
+- `ARCHITECTURE.md` should explain backend architecture, call flow, persistence, and integration boundaries.
+- If behavior changes in a way another developer would need to know, update the relevant documentation in the same change.
+
+## Development Philosophy
+
+This repository intentionally favors:
+
+- small focused modules
+- minimal abstraction layers
+- readability over architectural complexity
+
+Agents should avoid introducing heavy frameworks, complex dependency graphs, or premature abstractions unless explicitly requested.
