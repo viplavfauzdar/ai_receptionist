@@ -1,8 +1,12 @@
 import json
 import xml.etree.ElementTree as ET
+from datetime import datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import sessionmaker
 
+from app.calendar_service import CalendarServiceError
 from app.config import settings
 from app.models import AppointmentRequest, Business, CallLog, CallSession
 
@@ -233,6 +237,7 @@ def test_booking_flow_persists_state_across_turns_and_creates_appointment(client
         assert appointment.caller_name == "Jane Smith"
         assert appointment.caller_phone == "6784624453"
         assert appointment.requested_time == "Tuesday 3 pm"
+        assert appointment.calendar_event_id is None
 
 
 def test_callback_flow_persists_state_and_creates_request(client, db_session: sessionmaker):
@@ -320,6 +325,192 @@ def test_calls_endpoint_returns_logged_calls(client):
 
     assert res.status_code == 200
     assert res.json()[0]["call_sid"] == "CA-calls-endpoint"
+
+
+def test_booking_completion_creates_calendar_event_and_confirms_to_caller(
+    client,
+    db_session: sessionmaker,
+    mock_calendar_booking,
+):
+    mock_calendar_booking(
+        result=SimpleNamespace(
+            event_id="evt_123",
+            html_link="https://calendar.google.com/event?eid=evt_123",
+            scheduled_start=datetime(2026, 4, 7, 15, 0, tzinfo=ZoneInfo("America/New_York")),
+            scheduled_end=datetime(2026, 4, 7, 15, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
+    )
+    call_sid = "CA-calendar-success"
+
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Tuesday",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm and my number is 6784624453",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="My name is Jane Smith",
+    )
+
+    assert res.status_code == 200
+    assert "You're booked for Tuesday at 3 pm." in res.text
+
+    with db_session() as db:
+        appointment = db.query(AppointmentRequest).filter(AppointmentRequest.notes == "My name is Jane Smith").one()
+        assert appointment.confirmed is True
+        assert appointment.calendar_event_id == "evt_123"
+        assert appointment.calendar_event_link == "https://calendar.google.com/event?eid=evt_123"
+        assert appointment.scheduled_start is not None
+        assert appointment.scheduled_end is not None
+
+
+def test_booking_completion_falls_back_when_calendar_creation_fails(
+    client,
+    db_session: sessionmaker,
+    mock_calendar_booking,
+):
+    mock_calendar_booking(error=CalendarServiceError("calendar offline"))
+    call_sid = "CA-calendar-failure"
+
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Tuesday",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm and my number is 6784624453",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="My name is Jane Smith",
+    )
+
+    assert res.status_code == 200
+    assert "someone from the office will confirm the appointment shortly" in res.text
+
+    with db_session() as db:
+        appointment = db.query(AppointmentRequest).filter(AppointmentRequest.notes == "My name is Jane Smith").one()
+        assert appointment.confirmed is False
+        assert appointment.calendar_event_id is None
+        assert appointment.calendar_event_link is None
+
+
+def test_incomplete_booking_does_not_attempt_calendar_creation(client, monkeypatch):
+    called = {"value": False}
+
+    def _should_not_run(**_: object):
+        called["value"] = True
+        raise AssertionError("calendar should not be created for incomplete booking")
+
+    import importlib
+
+    main_module = importlib.import_module("app.main")
+
+    monkeypatch.setattr(main_module.settings, "google_calendar_enabled", True)
+    monkeypatch.setattr(main_module, "create_calendar_booking", _should_not_run)
+    res = _post_voice(
+        client,
+        CallSid="CA-calendar-incomplete",
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+
+    assert res.status_code == 200
+    assert called["value"] is False
+
+
+def test_booking_completion_handles_unexpected_calendar_error(
+    client,
+    db_session: sessionmaker,
+    mock_calendar_booking,
+):
+    mock_calendar_booking(error=RuntimeError("boom"))
+    call_sid = "CA-calendar-unexpected"
+
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="I want to book an appointment",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="Tuesday",
+    )
+    _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="3 pm and my number is 6784624453",
+    )
+    res = _post_voice(
+        client,
+        CallSid=call_sid,
+        From="+15551230000",
+        To="+15557654321",
+        CallStatus="in-progress",
+        SpeechResult="My name is Jane Smith",
+    )
+
+    assert res.status_code == 200
+    assert "someone from the office will confirm the appointment shortly" in res.text
+
+    with db_session() as db:
+        appointment = db.query(AppointmentRequest).filter(AppointmentRequest.notes == "My name is Jane Smith").one()
+        assert appointment.confirmed is False
 
 
 def test_voice_silence_turn_reprompts_and_logs_without_redirect(client, db_session: sessionmaker):

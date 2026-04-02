@@ -14,6 +14,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 ai_module = importlib.import_module("app.ai")
+calendar_module = importlib.import_module("app.calendar_service")
 main_module = importlib.import_module("app.main")
 from app.db import Base
 
@@ -23,12 +24,24 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     original = {
         "openai_api_key": ai_module.settings.openai_api_key,
         "openai_model": ai_module.settings.openai_model,
+        "google_calendar_enabled": ai_module.settings.google_calendar_enabled,
+        "google_calendar_id": ai_module.settings.google_calendar_id,
+        "google_client_secrets_file": ai_module.settings.google_client_secrets_file,
+        "google_token_file": ai_module.settings.google_token_file,
+        "google_timezone": ai_module.settings.google_timezone,
+        "appointment_duration_minutes": ai_module.settings.appointment_duration_minutes,
         "twilio_auth_token": ai_module.settings.twilio_auth_token,
         "disable_twilio_signature_validation": ai_module.settings.disable_twilio_signature_validation,
         "cors_allowed_origins": ai_module.settings.cors_allowed_origins,
     }
     monkeypatch.setattr(ai_module.settings, "openai_api_key", "")
     monkeypatch.setattr(ai_module.settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(ai_module.settings, "google_calendar_enabled", False)
+    monkeypatch.setattr(ai_module.settings, "google_calendar_id", "primary")
+    monkeypatch.setattr(ai_module.settings, "google_client_secrets_file", "./credentials.json")
+    monkeypatch.setattr(ai_module.settings, "google_token_file", "./token.json")
+    monkeypatch.setattr(ai_module.settings, "google_timezone", "America/New_York")
+    monkeypatch.setattr(ai_module.settings, "appointment_duration_minutes", 30)
     monkeypatch.setattr(ai_module.settings, "twilio_auth_token", "test-twilio-token")
     monkeypatch.setattr(ai_module.settings, "disable_twilio_signature_validation", True)
     monkeypatch.setattr(
@@ -105,3 +118,18 @@ def twilio_signature():
         return validator.compute_signature(url, params)
 
     return _build
+
+
+@pytest.fixture
+def mock_calendar_booking(monkeypatch: pytest.MonkeyPatch):
+    def _apply(*, result=None, error: Exception | None = None):
+        monkeypatch.setattr(main_module.settings, "google_calendar_enabled", True)
+
+        def _fake_create_calendar_booking(**_: object):
+            if error is not None:
+                raise error
+            return result
+
+        monkeypatch.setattr(main_module, "create_calendar_booking", _fake_create_calendar_booking)
+
+    return _apply

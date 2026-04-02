@@ -13,6 +13,7 @@ At a high level:
 - OpenAI is used to generate structured receptionist responses when an API key is configured.
 - A fallback rule-based path is used when the API key is missing or the model output is unusable.
 - Twilio signatures are validated on `/voice` by default before any session or DB work happens.
+- Completed bookings can optionally create Google Calendar events through a small backend service layer.
 
 The backend is intentionally small. Most logic lives in:
 
@@ -66,6 +67,10 @@ Key modules:
   Main FastAPI app, routes, Twilio webhook flow, DB writes, business lookup, session handling.
 - `backend/app/ai.py`
   LLM prompt construction, fallback logic, structured response parsing, slot extraction, phone formatting.
+- `backend/app/skills/receptionist_system_prompt.md`
+  Skill-style markdown prompt template for the receptionist system message.
+- `backend/app/calendar_service.py`
+  Google Calendar OAuth helper, appointment datetime builder, and event insertion.
 - `backend/app/models.py`
   SQLAlchemy ORM models.
 - `backend/app/db.py`
@@ -99,6 +104,27 @@ When `OPENAI_API_KEY` is present, the backend uses OpenAI to produce structured 
 When the key is missing, or the model output is invalid, the backend falls back to deterministic rule-based behavior.
 
 This design keeps the system usable offline or in partial-failure scenarios.
+
+The main receptionist system prompt is stored outside code in:
+
+- `backend/app/skills/receptionist_system_prompt.md`
+
+`backend/app/ai.py` loads that file at runtime and performs simple placeholder interpolation for business/session values. If the file is missing or unreadable, `ai.py` falls back to a built-in default template.
+
+### Google Calendar Integration
+
+When calendar booking is enabled, the backend can convert a completed booking flow into a real Google Calendar event.
+
+Configuration is env-driven:
+
+- `GOOGLE_CALENDAR_ENABLED`
+- `GOOGLE_CALENDAR_ID`
+- `GOOGLE_CLIENT_SECRETS_FILE`
+- `GOOGLE_TOKEN_FILE`
+- `GOOGLE_TIMEZONE`
+- `APPOINTMENT_DURATION_MINUTES`
+
+Local development uses OAuth desktop-app credentials and a locally stored `token.json`.
 
 ### CORS Configuration
 
@@ -225,6 +251,20 @@ Depending on the state:
 - booking completion creates an `appointment_requests` row only after `appointment_day`, `appointment_time`, `callback_number`, and `caller_name` are all present
 - callback completion creates an `appointment_requests` row only after `callback_number` and `caller_name` are present
 
+For booking completion, the backend then attempts Google Calendar creation if calendar booking is enabled.
+
+If calendar creation succeeds:
+
+- the appointment row is marked confirmed
+- calendar metadata is stored on the appointment row
+- the caller hears a concise booking confirmation
+
+If calendar creation fails:
+
+- the appointment row is still saved
+- the call does not fail
+- the caller hears a fallback office-confirmation message
+
 ### Step 9: TwiML Response Returned to Twilio
 
 The backend returns TwiML with:
@@ -297,6 +337,8 @@ The current state is persisted explicitly. Common states include:
 - `GENERAL_ASSISTANCE`
 
 This is a lightweight state machine, not a formal workflow engine.
+
+Calendar creation is intentionally not part of the LLM state machine. It happens in deterministic backend code after the state reaches booking completion.
 
 ## 4. Intent System
 
@@ -387,6 +429,15 @@ Validation rules:
 
 If the model returns malformed JSON, empty content, missing fields, invalid intent/state values, or an unusable payload, the backend falls back to a deterministic safe response instead of exposing raw model output to the Twilio flow.
 
+The following concerns remain in code rather than the prompt file:
+
+- output validation
+- state normalization
+- slot extraction
+- phone-number formatting
+- persistence rules
+- fallback logic
+
 ### Fallback Mode
 
 Fallback mode is used when:
@@ -407,7 +458,28 @@ If output is invalid, it falls back safely rather than crashing the route.
 
 This is important because `/voice` must continue returning valid TwiML under failure.
 
-## 6. Phone Number Normalization Logic
+## 6. Booking-to-Calendar Flow
+
+When a booking flow reaches completion:
+
+1. `/voice` persists the completed booking request.
+2. `backend/app/main.py` checks whether calendar booking is enabled.
+3. `backend/app/calendar_service.py` builds the appointment window from:
+   - `appointment_day`
+   - `appointment_time`
+   - `GOOGLE_TIMEZONE`
+   - `APPOINTMENT_DURATION_MINUTES`
+4. The calendar service inserts a Google Calendar event.
+5. The backend stores:
+   - `calendar_event_id`
+   - `calendar_event_link`
+   - `scheduled_start`
+   - `scheduled_end`
+6. The assistant confirms the booking to the caller.
+
+If any calendar step fails, the appointment request remains in SQLite and the assistant falls back to manual office confirmation wording.
+
+## 7. Phone Number Normalization Logic
 
 The backend normalizes phone numbers in two different ways:
 
@@ -439,7 +511,7 @@ For 10-digit US numbers:
 
 This formatting is applied in code, not left to LLM wording.
 
-## 7. Testing Strategy
+## 8. Testing Strategy
 
 The backend test suite uses `pytest`.
 
@@ -491,13 +563,14 @@ The suite currently exercises:
 - Twilio signature validation
 - CORS behavior for allowed and disallowed origins
 - empty-gather silence handling and repeated-silence hangup behavior
+- mocked Google Calendar success and failure behavior
 - DB writes
 - session persistence
 - fallback logic
 - mocked LLM handling
 - phone formatting logic
 
-## 8. How to Run the System Locally
+## 9. How to Run the System Locally
 
 ### Backend
 
@@ -512,6 +585,12 @@ uvicorn app.main:app --reload --port 8000
 
 Important local env vars:
 
+- `GOOGLE_CALENDAR_ENABLED`
+- `GOOGLE_CALENDAR_ID`
+- `GOOGLE_CLIENT_SECRETS_FILE`
+- `GOOGLE_TOKEN_FILE`
+- `GOOGLE_TIMEZONE`
+- `APPOINTMENT_DURATION_MINUTES`
 - `TWILIO_AUTH_TOKEN`
 - `DISABLE_TWILIO_SIGNATURE_VALIDATION`
 - `CORS_ALLOWED_ORIGINS`
@@ -540,7 +619,22 @@ Set the Twilio phone number voice webhook to:
 https://YOUR-NGROK-URL/voice
 ```
 
-## 9. How to Run the Backend Tests
+### Local Google Calendar OAuth
+
+To authorize the local backend against Google Calendar:
+
+1. Place the OAuth desktop client file at `backend/credentials.json`.
+2. Start the backend virtualenv.
+3. Run:
+
+```bash
+cd backend
+python -m app.calendar_service
+```
+
+This opens the local consent flow and writes `backend/token.json`.
+
+## 10. How to Run the Backend Tests
 
 Install backend dependencies:
 
@@ -563,7 +657,7 @@ backend/.venv/bin/python -m pytest backend/tests \
   --cov-report=term-missing
 ```
 
-## 10. Future Extensions
+## 11. Future Extensions
 
 ### Multi-Tenant Businesses
 

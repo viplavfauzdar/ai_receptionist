@@ -60,4 +60,8 @@ class AppointmentRequest(Base):
     requested_time = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)
     confirmed = Column(Boolean, default=False)
+    calendar_event_id = Column(String(255), nullable=True)
+    calendar_event_link = Column(Text, nullable=True)
+    scheduled_start = Column(DateTime, nullable=True)
+    scheduled_end = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

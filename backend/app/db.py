@@ -36,6 +36,14 @@ def ensure_sqlite_compatibility():
         appointment_columns = {column["name"] for column in inspector.get_columns("appointment_requests")}
         if "business_id" not in appointment_columns:
             statements.append("ALTER TABLE appointment_requests ADD COLUMN business_id INTEGER")
+        if "calendar_event_id" not in appointment_columns:
+            statements.append("ALTER TABLE appointment_requests ADD COLUMN calendar_event_id VARCHAR(255)")
+        if "calendar_event_link" not in appointment_columns:
+            statements.append("ALTER TABLE appointment_requests ADD COLUMN calendar_event_link TEXT")
+        if "scheduled_start" not in appointment_columns:
+            statements.append("ALTER TABLE appointment_requests ADD COLUMN scheduled_start DATETIME")
+        if "scheduled_end" not in appointment_columns:
+            statements.append("ALTER TABLE appointment_requests ADD COLUMN scheduled_end DATETIME")
 
     if "businesses" in table_names:
         business_columns = {column["name"] for column in inspector.get_columns("businesses")}

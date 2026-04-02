@@ -35,6 +35,10 @@ class AppointmentOut(BaseModel):
     requested_time: str | None = None
     notes: str | None = None
     confirmed: bool
+    calendar_event_id: str | None = None
+    calendar_event_link: str | None = None
+    scheduled_start: datetime | None = None
+    scheduled_end: datetime | None = None
     created_at: datetime
 
     class Config:

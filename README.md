@@ -6,6 +6,7 @@ Twilio + FastAPI backend with:
 - basic multi-tenant business lookup
 - Twilio signature validation
 - config-driven CORS
+- optional Google Calendar booking
 - persistent per-call session state
 - SQLite logging via SQLAlchemy
 - basic appointment capture
@@ -46,6 +47,7 @@ Runtime responsibilities:
 Code locations:
 - Twilio webhook and TwiML generation: [`backend/app/main.py`](backend/app/main.py)
 - Reply generation and intent detection: [`backend/app/ai.py`](backend/app/ai.py)
+- Prompt template: [`backend/app/skills/receptionist_system_prompt.md`](backend/app/skills/receptionist_system_prompt.md)
 - Database connection: [`backend/app/db.py`](backend/app/db.py)
 - Models: [`backend/app/models.py`](backend/app/models.py)
 
@@ -77,6 +79,12 @@ For LLM mode, edit `backend/.env` before starting the server and set a real Open
 ```env
 OPENAI_API_KEY=your_real_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
+GOOGLE_CALENDAR_ENABLED=true
+GOOGLE_CALENDAR_ID=primary
+GOOGLE_CLIENT_SECRETS_FILE=./credentials.json
+GOOGLE_TOKEN_FILE=./token.json
+GOOGLE_TIMEZONE=America/New_York
+APPOINTMENT_DURATION_MINUTES=30
 TWILIO_AUTH_TOKEN=your_real_twilio_auth_token
 DISABLE_TWILIO_SIGNATURE_VALIDATION=false
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
@@ -103,10 +111,14 @@ Behavior:
 - If `OPENAI_API_KEY` is missing or the OpenAI request fails, the backend falls back to simple rule-based intent detection and short canned replies.
 - Business profile data is resolved from the `businesses` table first, with `.env` fallback defaults when no business row matches.
 - The `state` value is persisted so the next `/voice` turn can continue from the prior step instead of restarting.
+- The main receptionist system prompt now lives in `backend/app/skills/receptionist_system_prompt.md` and is loaded by `backend/app/ai.py` at runtime.
+- The prompt loader interpolates business values such as `business_name` and `business_hours`.
+- If the prompt file is missing or unreadable, the backend falls back to a built-in default prompt so `/voice` does not break.
 - Model output is validated and sanitized before the `/voice` route uses it, so malformed JSON, missing fields, invalid intent/state values, empty content, and timeout/error cases all recover to a safe fallback response instead of breaking the Twilio flow.
 - The backend validates the `X-Twilio-Signature` header by default. For local development behind `ngrok`, you can temporarily set `DISABLE_TWILIO_SIGNATURE_VALIDATION=true`.
 - CORS is restricted by `CORS_ALLOWED_ORIGINS`; the default allows only local frontend origins.
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
+- When Google Calendar is enabled and a booking is complete, the backend creates a real calendar event and confirms it to the caller. If calendar creation fails, the request is still saved and the caller gets a fallback confirmation.
 
 ## 2) Expose locally to Twilio
 
@@ -140,6 +152,12 @@ Open:
 Backend `.env`:
 - `OPENAI_API_KEY` required for real LLM mode
 - `OPENAI_MODEL=gpt-4o-mini`
+- `GOOGLE_CALENDAR_ENABLED=true`
+- `GOOGLE_CALENDAR_ID=primary`
+- `GOOGLE_CLIENT_SECRETS_FILE=./credentials.json`
+- `GOOGLE_TOKEN_FILE=./token.json`
+- `GOOGLE_TIMEZONE=America/New_York`
+- `APPOINTMENT_DURATION_MINUTES=30`
 - `TWILIO_AUTH_TOKEN` required for production webhook validation
 - `DISABLE_TWILIO_SIGNATURE_VALIDATION=false`
 - `CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000`
@@ -171,6 +189,7 @@ Frontend `.env.local`:
 - For production, replace SQLite with Postgres and add real calendar integration.
 - Twilio Gather speech handling is implemented in `/voice` with `speech_timeout="auto"`, `timeout=3`, and `action_on_empty_result=True`.
 - Silent turns are tracked in session slot data with a small `silence_count` so the call does not fall into redirect loops.
+- If Google Calendar booking is enabled, successful bookings persist `calendar_event_id`, `calendar_event_link`, `scheduled_start`, and `scheduled_end` on `appointment_requests`.
 
 Example 3-turn booking flow:
 1. Caller: `I want to book an appointment`
@@ -220,7 +239,45 @@ curl -X POST http://127.0.0.1:8000/api/businesses \
 - multi-tenant business configs
 - role-based auth
 
-## 8) Backend Tests
+## 8) Local Google Calendar Setup
+
+1. In Google Cloud Console, create or use a project.
+2. Enable the Google Calendar API for that project.
+3. Create an OAuth client for a desktop app.
+4. Download the OAuth client JSON and place it at:
+
+```text
+backend/credentials.json
+```
+
+5. In `backend/.env`, keep:
+
+```env
+GOOGLE_CALENDAR_ENABLED=true
+GOOGLE_CALENDAR_ID=primary
+GOOGLE_CLIENT_SECRETS_FILE=./credentials.json
+GOOGLE_TOKEN_FILE=./token.json
+GOOGLE_TIMEZONE=America/New_York
+APPOINTMENT_DURATION_MINUTES=30
+```
+
+6. Run the local OAuth flow once:
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m app.calendar_service
+```
+
+7. That command opens the browser for Google consent and writes the local refreshable token to:
+
+```text
+backend/token.json
+```
+
+After that, completed booking calls can create real Google Calendar events.
+
+## 9) Backend Tests
 
 Install backend dependencies into the backend virtualenv:
 

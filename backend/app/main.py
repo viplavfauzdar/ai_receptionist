@@ -13,6 +13,7 @@ from .ai import (
     detect_and_respond,
     format_phone_number_for_speech,
 )
+from .calendar_service import CalendarServiceError, create_calendar_booking
 from .config import settings
 from .db import Base, ensure_sqlite_compatibility, engine, get_db
 from .models import AppointmentRequest, Business, CallLog, CallSession
@@ -238,6 +239,29 @@ def _build_speech_safe_response(result_intent: str, result_state: str, response:
     return response
 
 
+def _build_requested_time(slot_data: dict[str, str]) -> str | None:
+    return (
+        " ".join(
+            part
+            for part in (
+                slot_data.get("appointment_day"),
+                slot_data.get("appointment_time"),
+            )
+            if part
+        )
+        or None
+    )
+
+
+def _should_create_calendar_event(result_intent: str, result_state: str, slot_data: dict[str, str]) -> bool:
+    return (
+        settings.google_calendar_enabled
+        and result_intent == "BOOK_APPOINTMENT"
+        and result_state == "BOOKING_COMPLETE"
+        and all(slot_data.get(key) for key in ("appointment_day", "appointment_time", "callback_number"))
+    )
+
+
 def _get_silence_count(slot_data: dict[str, str]) -> int:
     raw_value = slot_data.get("silence_count", "0")
     try:
@@ -401,17 +425,33 @@ async def voice(request: Request, db: Session = Depends(get_db)):
             business_id=business_context.id,
             caller_name=merged_slot_data.get("caller_name"),
             caller_phone=merged_slot_data.get("callback_number") or from_number,
-            requested_time=" ".join(
-                part
-                for part in (
-                    merged_slot_data.get("appointment_day"),
-                    merged_slot_data.get("appointment_time"),
-                )
-                if part
-            )
-            or None,
+            requested_time=_build_requested_time(merged_slot_data),
             notes=speech,
         )
+        if _should_create_calendar_event(result.intent, result.state, merged_slot_data):
+            try:
+                calendar_booking = create_calendar_booking(
+                    caller_name=merged_slot_data.get("caller_name"),
+                    callback_number=merged_slot_data["callback_number"],
+                    appointment_day=merged_slot_data["appointment_day"],
+                    appointment_time=merged_slot_data["appointment_time"],
+                    notes=speech,
+                )
+                appointment.calendar_event_id = calendar_booking.event_id
+                appointment.calendar_event_link = calendar_booking.html_link
+                appointment.scheduled_start = calendar_booking.scheduled_start
+                appointment.scheduled_end = calendar_booking.scheduled_end
+                appointment.confirmed = True
+                speech_safe_response = (
+                    f"Thanks {merged_slot_data.get('caller_name') or ''}. "
+                    f"You're booked for {merged_slot_data['appointment_day']} at {merged_slot_data['appointment_time']}."
+                ).replace("  ", " ").strip()
+            except CalendarServiceError as exc:
+                _log_voice(f"calendar_booking_failed reason=calendar_service_error error={exc}")
+                speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
+            except Exception as exc:
+                _log_voice(f"calendar_booking_failed reason=unexpected_error error={exc}")
+                speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
         db.add(appointment)
         merged_slot_data["request_saved"] = "true"
 

@@ -72,6 +72,10 @@ def test_ensure_sqlite_compatibility_adds_missing_columns(monkeypatch: pytest.Mo
     assert any("intent_data" in stmt for stmt in executed)
     assert any("call_logs ADD COLUMN business_id" in stmt for stmt in executed)
     assert any("appointment_requests ADD COLUMN business_id" in stmt for stmt in executed)
+    assert any("appointment_requests ADD COLUMN calendar_event_id" in stmt for stmt in executed)
+    assert any("appointment_requests ADD COLUMN calendar_event_link" in stmt for stmt in executed)
+    assert any("appointment_requests ADD COLUMN scheduled_start" in stmt for stmt in executed)
+    assert any("appointment_requests ADD COLUMN scheduled_end" in stmt for stmt in executed)
     assert any("businesses ADD COLUMN twilio_number_normalized" in stmt for stmt in executed)
     assert any("ix_businesses_twilio_number_normalized" in stmt for stmt in executed)
 
@@ -88,7 +92,13 @@ def test_ensure_sqlite_compatibility_noops_when_columns_present(monkeypatch: pyt
                 return [{"name": "detected_intent"}, {"name": "intent_data"}, {"name": "business_id"}]
             if table_name == "businesses":
                 return [{"name": "twilio_number_normalized"}]
-            return [{"name": "business_id"}]
+            return [
+                {"name": "business_id"},
+                {"name": "calendar_event_id"},
+                {"name": "calendar_event_link"},
+                {"name": "scheduled_start"},
+                {"name": "scheduled_end"},
+            ]
 
     class FakeConnection:
         def execute(self, statement):
@@ -198,6 +208,8 @@ def test_main_phone_normalization_and_speech_helpers():
         )
         == "Thanks. I have your day, time, and callback number as 6 7 8, 4 6 2, 4 4 5 3. We will follow up shortly."
     )
+    assert main_module._build_requested_time({"appointment_day": "Tuesday", "appointment_time": "3 pm"}) == "Tuesday 3 pm"
+    assert main_module._build_requested_time({}) is None
 
 
 def test_main_request_and_session_helpers(db_session):

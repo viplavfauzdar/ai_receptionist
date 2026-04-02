@@ -1,4 +1,5 @@
 import app.ai as ai_module
+import pytest
 from app.ai import (
     BusinessContext,
     SessionContext,
@@ -21,6 +22,31 @@ def test_format_phone_number_for_speech_handles_non_digit_string():
 
 def test_openai_client_helper_returns_none_without_key(env_overrides):
     assert ai_module._get_client() is None
+
+
+def test_system_prompt_loads_from_skill_file(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    prompt_path = tmp_path / "receptionist_system_prompt.md"
+    prompt_path.write_text("Business {{business_name}} hours {{business_hours}}", encoding="utf-8")
+    monkeypatch.setattr(ai_module, "PROMPT_FILE_PATH", prompt_path)
+
+    prompt = ai_module._system_prompt(
+        BusinessContext(name="Acme Dental", business_hours="Mon-Fri 8 AM to 4 PM"),
+        SessionContext(),
+    )
+
+    assert prompt == "Business Acme Dental hours Mon-Fri 8 AM to 4 PM"
+
+
+def test_system_prompt_uses_builtin_default_when_file_missing(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    monkeypatch.setattr(ai_module, "PROMPT_FILE_PATH", tmp_path / "missing.md")
+
+    prompt = ai_module._system_prompt(
+        BusinessContext(name="Acme Dental", business_hours="Mon-Fri 8 AM to 4 PM"),
+        SessionContext(),
+    )
+
+    assert "Acme Dental" in prompt
+    assert "Mon-Fri 8 AM to 4 PM" in prompt
 
 
 def test_requested_time_extraction_handles_day_and_time():
