@@ -4,6 +4,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    enable_streaming_voice_experiment: bool = False
+    streaming_ws_path: str = "/ws/media-stream"
+    streaming_voice_route: str = "/voice-stream"
     max_call_turns: int = 12
     max_llm_calls_per_session: int = 6
     enable_basic_rate_limiting: bool = True

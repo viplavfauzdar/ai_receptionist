@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import json
+from base64 import b64encode
+
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+from twilio.twiml.voice_response import Connect, Parameter, Stream, VoiceResponse
+
+from .config import settings
+from .streaming_session import StreamingSessionStore
+from .streaming_voice import maybe_transcript_to_reply
+from .stt_adapter import StreamingSTTAdapter
+from .tts_adapter import StreamingTTSAdapter
+
+streaming_router = APIRouter()
+streaming_session_store = StreamingSessionStore()
+stt_adapter = StreamingSTTAdapter()
+tts_adapter = StreamingTTSAdapter()
+TRANSCRIBE_BUFFER_BYTES = 320
+
+
+def _log_streaming(message: str) -> None:
+    print(f"[streaming] {message}", flush=True)
+
+
+def _build_stream_websocket_url(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    ws_scheme = "wss" if forwarded_proto == "https" else "ws"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{ws_scheme}://{host}{settings.streaming_ws_path}"
+
+
+def _build_streaming_twiml(request: Request) -> str:
+    response = VoiceResponse()
+    connect = Connect()
+    stream = Stream(url=_build_stream_websocket_url(request))
+    stream.append(Parameter(name="route", value="experimental-stream"))
+    connect.append(stream)
+    response.append(connect)
+    return str(response)
+
+
+def _build_outbound_mark_message(*, stream_sid: str, mark_name: str) -> dict[str, object]:
+    return {
+        "event": "mark",
+        "streamSid": stream_sid,
+        "mark": {"name": mark_name},
+    }
+
+
+def _build_outbound_media_message(*, stream_sid: str, audio_bytes: bytes) -> dict[str, object]:
+    return {
+        "event": "media",
+        "streamSid": stream_sid,
+        "media": {"payload": b64encode(audio_bytes).decode("ascii")},
+    }
+
+
+@streaming_router.post(settings.streaming_voice_route)
+async def voice_stream(request: Request):
+    if not settings.enable_streaming_voice_experiment:
+        raise HTTPException(status_code=404, detail="Streaming voice experiment is disabled")
+    twiml = _build_streaming_twiml(request)
+    return Response(content=twiml, media_type="application/xml")
+
+
+@streaming_router.websocket(settings.streaming_ws_path)
+async def media_stream(websocket: WebSocket):
+    await websocket.accept()
+    if not settings.enable_streaming_voice_experiment:
+        await websocket.close(code=1008)
+        return
+
+    current_stream_sid: str | None = None
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+            payload = json.loads(raw_text)
+            event_type = str(payload.get("event") or "").lower()
+
+            if event_type == "connected":
+                protocol = payload.get("protocol", "Call")
+                version = payload.get("version", "1.0.0")
+                _log_streaming(f"event=connected protocol={protocol} version={version}")
+                continue
+
+            if event_type == "start":
+                start = payload.get("start") or {}
+                current_stream_sid = str(start.get("streamSid") or payload.get("streamSid") or "unknown-stream")
+                custom_parameters = {
+                    str(key): str(value)
+                    for key, value in (start.get("customParameters") or {}).items()
+                }
+                session = streaming_session_store.create_or_update_start(
+                    stream_sid=current_stream_sid,
+                    call_sid=start.get("callSid"),
+                    account_sid=start.get("accountSid"),
+                    from_number=(start.get("from") or start.get("caller")) or custom_parameters.get("From"),
+                    to_number=(start.get("to") or start.get("called")) or custom_parameters.get("To"),
+                    custom_parameters=custom_parameters,
+                )
+                _log_streaming(
+                    f"event=start stream_sid={session.stream_sid} call_sid={session.call_sid} "
+                    f"from_number={session.from_number} to_number={session.to_number}"
+                )
+                await websocket.send_json(
+                    _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="stream-started")
+                )
+                continue
+
+            if event_type == "media":
+                media = payload.get("media") or {}
+                current_stream_sid = str(payload.get("streamSid") or current_stream_sid or "unknown-stream")
+                session = streaming_session_store.get(current_stream_sid)
+                if session is None:
+                    session = streaming_session_store.create_connected_placeholder(current_stream_sid)
+                session.record_event("media")
+                session.append_media_payload(str(media.get("payload") or ""))
+                transcript_text = None
+                if len(session.audio_buffer) >= TRANSCRIBE_BUFFER_BYTES:
+                    transcript_text = stt_adapter.transcribe_buffer(session, session.flush_audio_buffer())
+                reply_plan = maybe_transcript_to_reply(session, transcript_text)
+                await websocket.send_json(
+                    _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="media-received")
+                )
+                if reply_plan.reply_text:
+                    audio_bytes = tts_adapter.synthesize_mulaw(reply_plan.reply_text)
+                    if audio_bytes:
+                        await websocket.send_json(_build_outbound_media_message(stream_sid=session.stream_sid, audio_bytes=audio_bytes))
+                        await websocket.send_json(
+                            _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="reply-sent")
+                        )
+                continue
+
+            if event_type == "mark":
+                current_stream_sid = str(payload.get("streamSid") or current_stream_sid or "unknown-stream")
+                session = streaming_session_store.get(current_stream_sid)
+                if session is not None:
+                    session.record_event("mark")
+                    await websocket.send_json(
+                        _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="mark-received")
+                    )
+                _log_streaming(f"event=mark stream_sid={current_stream_sid}")
+                continue
+
+            if event_type == "stop":
+                stop = payload.get("stop") or {}
+                current_stream_sid = str(stop.get("streamSid") or payload.get("streamSid") or current_stream_sid or "unknown-stream")
+                session = streaming_session_store.remove(current_stream_sid)
+                _log_streaming(
+                    f"event=stop stream_sid={current_stream_sid} "
+                    f"media_chunks={session.media_chunk_count if session else 0} "
+                    f"audio_bytes={session.total_audio_bytes if session else 0}"
+                )
+                await websocket.close(code=1000)
+                return
+
+            _log_streaming(f"event=ignored type={event_type!r}")
+    except WebSocketDisconnect:
+        if current_stream_sid:
+            streaming_session_store.remove(current_stream_sid)

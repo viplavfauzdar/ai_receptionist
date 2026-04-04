@@ -24,6 +24,9 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     original = {
         "openai_api_key": ai_module.settings.openai_api_key,
         "openai_model": ai_module.settings.openai_model,
+        "enable_streaming_voice_experiment": ai_module.settings.enable_streaming_voice_experiment,
+        "streaming_ws_path": ai_module.settings.streaming_ws_path,
+        "streaming_voice_route": ai_module.settings.streaming_voice_route,
         "max_call_turns": ai_module.settings.max_call_turns,
         "max_llm_calls_per_session": ai_module.settings.max_llm_calls_per_session,
         "enable_basic_rate_limiting": ai_module.settings.enable_basic_rate_limiting,
@@ -41,6 +44,9 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     }
     monkeypatch.setattr(ai_module.settings, "openai_api_key", "")
     monkeypatch.setattr(ai_module.settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(ai_module.settings, "enable_streaming_voice_experiment", False)
+    monkeypatch.setattr(ai_module.settings, "streaming_ws_path", "/ws/media-stream")
+    monkeypatch.setattr(ai_module.settings, "streaming_voice_route", "/voice-stream")
     monkeypatch.setattr(ai_module.settings, "max_call_turns", 12)
     monkeypatch.setattr(ai_module.settings, "max_llm_calls_per_session", 6)
     monkeypatch.setattr(ai_module.settings, "enable_basic_rate_limiting", True)

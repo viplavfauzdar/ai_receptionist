@@ -9,6 +9,7 @@ At a high level:
 - Twilio receives the phone call and sends webhook requests to the backend.
 - `ngrok` is used in local development to expose the backend to Twilio.
 - FastAPI handles the `/voice` webhook and returns TwiML.
+- FastAPI also exposes a separate experimental Twilio Media Streams path for future lower-latency voice.
 - SQLite stores business records, call logs, appointment requests, and per-call session state.
 - OpenAI is used to generate structured receptionist responses when an API key is configured.
 - A fallback rule-based path is used when the API key is missing or the model output is unusable.
@@ -46,6 +47,16 @@ All `Gather` usage in the current backend is configured with:
 
 The backend is therefore a webhook-driven state machine.
 
+The current primary path remains `POST /voice`.
+
+An experimental parallel path also exists for Twilio bidirectional Media Streams:
+
+1. Twilio sends an HTTP request to `POST /voice-stream`.
+2. The backend responds with TwiML containing `<Connect><Stream>`.
+3. Twilio opens one bidirectional WebSocket to `/ws/media-stream`.
+4. The backend receives `connected`, `start`, `media`, `mark`, and `stop` messages over that socket.
+5. Media frames are buffered in memory for future STT, LLM, and TTS integration.
+
 ### ngrok for Local Development
 
 Twilio cannot reach `localhost` directly. During local development:
@@ -72,6 +83,16 @@ Key modules:
   Skill-style markdown prompt template for the receptionist system message.
 - `backend/app/calendar_service.py`
   Google Calendar OAuth helper, appointment datetime builder, and event insertion.
+- `backend/app/streaming_routes.py`
+  Experimental `POST /voice-stream` route and `/ws/media-stream` WebSocket endpoint.
+- `backend/app/streaming_session.py`
+  In-memory per-stream session state for Twilio Media Streams.
+- `backend/app/streaming_voice.py`
+  Placeholder bridge where future streaming transcripts can feed assistant reply generation.
+- `backend/app/stt_adapter.py`
+  Placeholder streaming STT boundary.
+- `backend/app/tts_adapter.py`
+  Placeholder streaming TTS boundary.
 - `backend/app/models.py`
   SQLAlchemy ORM models.
 - `backend/app/db.py`
@@ -80,6 +101,16 @@ Key modules:
   Env-backed configuration.
 - `backend/app/schemas.py`
   Pydantic response/request schemas for API routes.
+
+### Experimental Streaming Path
+
+The streaming path is intentionally isolated from the main receptionist flow.
+
+- `POST /voice-stream` returns TwiML with `<Connect><Stream>`
+- `/ws/media-stream` accepts Twilio Media Streams WebSocket messages
+- the current implementation only handles the transport skeleton and in-memory stream session state
+- the existing `POST /voice` path remains the primary production path for booking, calendar, and current receptionist behavior
+- this streaming path is the future direction for lower-latency voice once STT, LLM, and TTS adapters are plugged in
 
 ### SQLite Persistence Layer
 
@@ -653,6 +684,8 @@ Current structure:
   direct AI/helper behavior
 - `backend/tests/test_backend_helpers.py`
   DB helper and internal helper branch coverage
+- `backend/tests/test_streaming_routes.py`
+  experimental Media Streams route and WebSocket coverage
 
 ### Mocked OpenAI Calls
 
@@ -719,6 +752,9 @@ Important local env vars:
 - `GOOGLE_OAUTH_REDIRECT_URI`
 - `GOOGLE_TIMEZONE`
 - `APPOINTMENT_DURATION_MINUTES`
+- `ENABLE_STREAMING_VOICE_EXPERIMENT`
+- `STREAMING_WS_PATH`
+- `STREAMING_VOICE_ROUTE`
 - `TWILIO_AUTH_TOKEN`
 - `DISABLE_TWILIO_SIGNATURE_VALIDATION`
 - `CORS_ALLOWED_ORIGINS`
@@ -749,6 +785,12 @@ Set the Twilio phone number voice webhook to:
 
 ```text
 https://YOUR-NGROK-URL/voice
+```
+
+For the experimental streaming path, set the Twilio voice webhook to:
+
+```text
+https://YOUR-NGROK-URL/voice-stream
 ```
 
 ### Local Google Calendar OAuth

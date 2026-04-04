@@ -93,6 +93,9 @@ For LLM mode, edit `backend/.env` before starting the server and set a real Open
 ```env
 OPENAI_API_KEY=your_real_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
+ENABLE_STREAMING_VOICE_EXPERIMENT=false
+STREAMING_WS_PATH=/ws/media-stream
+STREAMING_VOICE_ROUTE=/voice-stream
 MAX_CALL_TURNS=12
 MAX_LLM_CALLS_PER_SESSION=6
 ENABLE_BASIC_RATE_LIMITING=true
@@ -136,6 +139,8 @@ Behavior:
 - Model output is validated and sanitized before the `/voice` route uses it, so malformed JSON, missing fields, invalid intent/state values, empty content, and timeout/error cases all recover to a safe fallback response instead of breaking the Twilio flow.
 - The backend validates the `X-Twilio-Signature` header by default. For local development behind `ngrok`, you can temporarily set `DISABLE_TWILIO_SIGNATURE_VALIDATION=true`.
 - CORS is restricted by `CORS_ALLOWED_ORIGINS`; the default allows only local frontend origins.
+- The existing `POST /voice` TwiML flow remains the primary production path.
+- A separate experimental streaming path now exists via `POST /voice-stream` plus WebSocket media streaming on `/ws/media-stream`. It is isolated from the current booking and TwiML flow and is intended for lower-latency future work.
 - Abuse protections are config-driven: `MAX_CALL_TURNS` ends runaway sessions cleanly, `MAX_LLM_CALLS_PER_SESSION` stops repeated model calls and switches to deterministic fallback, and `ENABLE_BASIC_RATE_LIMITING` plus `MAX_NEW_CALLS_PER_NUMBER_PER_HOUR` throttle repeated new calls from the same caller number.
 - If Twilio sends a malformed `/voice` webhook without required identifiers such as `CallSid` or `From`, the backend returns a short TwiML apology and ends the call instead of crashing.
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
@@ -177,6 +182,9 @@ Open:
 Backend `.env`:
 - `OPENAI_API_KEY` required for real LLM mode
 - `OPENAI_MODEL=gpt-4o-mini`
+- `ENABLE_STREAMING_VOICE_EXPERIMENT=false`
+- `STREAMING_WS_PATH=/ws/media-stream`
+- `STREAMING_VOICE_ROUTE=/voice-stream`
 - `MAX_CALL_TURNS=12`
 - `MAX_LLM_CALLS_PER_SESSION=6`
 - `ENABLE_BASIC_RATE_LIMITING=true`
@@ -212,6 +220,7 @@ Frontend `.env.local`:
 - Callback requests are saved only after `callback_number` and `caller_name` are present.
 - Call sessions also track `turn_count`, `llm_call_count`, and `last_protection_reason` to stop runaway loops and excessive model usage.
 - The Twilio voice webhook contract remains `POST /voice`.
+- The experimental streaming webhook is separate at `POST /voice-stream` and does not replace the main `/voice` flow.
 - The receptionist is LLM-first when `OPENAI_API_KEY` is configured.
 - Booking and callback intents create a simple database entry in `appointment_requests`.
 - Call logs store `business_id`, `detected_intent`, and structured `intent_data`.
@@ -228,6 +237,41 @@ Frontend `.env.local`:
 - If Google Calendar booking is enabled, successful bookings persist `calendar_event_id`, `calendar_event_link`, `scheduled_start`, and `scheduled_end` on `appointment_requests`.
 - Calendar conflict detection ignores cancelled events.
 - Overlap rule: any real interval intersection blocks the slot, but an appointment that starts exactly when a prior event ends is allowed.
+
+## 6A) Experimental Streaming Voice Path
+
+This is an isolated parallel path for future lower-latency voice using Twilio bidirectional Media Streams.
+
+- Twilio webhook: `POST /voice-stream`
+- WebSocket endpoint: `/ws/media-stream`
+- TwiML uses `<Connect><Stream>` so Twilio opens one bidirectional WebSocket per call
+- current implementation only receives and buffers media frames, tracks per-stream state, and provides placeholder STT/LLM/TTS boundaries
+- the current `/voice` path remains the primary path and is unchanged
+
+To test the experimental path locally:
+
+1. Set in `backend/.env`:
+
+```env
+ENABLE_STREAMING_VOICE_EXPERIMENT=true
+STREAMING_VOICE_ROUTE=/voice-stream
+STREAMING_WS_PATH=/ws/media-stream
+```
+
+2. Restart the backend.
+3. Point a Twilio phone number’s voice webhook at:
+
+```text
+https://YOUR-NGROK-URL/voice-stream
+```
+
+4. Twilio will receive TwiML with `<Connect><Stream>` and then connect to:
+
+```text
+wss://YOUR-NGROK-URL/ws/media-stream
+```
+
+This path is currently transport-only. It is ready for future STT, LLM, and TTS integration, but it does not replace the main receptionist flow yet.
 
 Example 3-turn booking flow:
 1. Caller: `I want to book an appointment`

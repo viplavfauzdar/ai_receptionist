@@ -27,6 +27,7 @@ from .config import settings
 from .db import Base, ensure_sqlite_compatibility, engine, get_db
 from .models import AppointmentRequest, Business, CallLog, CallSession
 from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut, GoogleCalendarSelection
+from .streaming_routes import streaming_router
 
 Base.metadata.create_all(bind=engine)
 ensure_sqlite_compatibility()
@@ -40,6 +41,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+app.include_router(streaming_router)
 
 
 @app.get("/")
