@@ -107,6 +107,7 @@ Key modules:
 The streaming path is intentionally isolated from the main receptionist flow.
 
 - `POST /voice-stream` returns TwiML with `<Connect><Stream>`
+- that TwiML starts with a short `<Say>` greeting so the experimental path does not begin with silence
 - `/ws/media-stream` accepts Twilio Media Streams WebSocket messages
 - inbound `media` frames are decoded from base64 mu-law, converted to 16-bit PCM, upsampled to 16kHz, buffered, and passed through a narrow STT boundary
 - the streaming STT adapter wraps buffered audio as a mono 16-bit 16kHz WAV before calling the OpenAI transcription API

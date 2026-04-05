@@ -33,6 +33,7 @@ def _build_stream_websocket_url(request: Request) -> str:
 
 def _build_streaming_twiml(request: Request) -> str:
     response = VoiceResponse()
+    response.say("Welcome. Please hold while I connect you.")
     connect = Connect()
     stream = Stream(url=_build_stream_websocket_url(request))
     stream.append(Parameter(name="route", value="experimental-stream"))

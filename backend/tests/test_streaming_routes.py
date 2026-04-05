@@ -22,6 +22,9 @@ def test_voice_stream_returns_connect_stream_twiml(client, monkeypatch):
 
     assert res.status_code == 200
     xml = _parse_xml(res.text)
+    say = xml.find("Say")
+    assert say is not None
+    assert say.text == "Welcome. Please hold while I connect you."
     connect = xml.find("Connect")
     assert connect is not None
     stream = connect.find("Stream")
