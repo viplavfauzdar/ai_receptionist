@@ -246,6 +246,7 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - WebSocket endpoint: `/ws/media-stream`
 - TwiML uses `<Connect><Stream>` so Twilio opens one bidirectional WebSocket per call
 - current implementation decodes inbound Twilio mu-law frames, converts them to PCM, upsamples from 8kHz to 16kHz, buffers short chunks for STT, and passes any transcript text into the existing assistant logic on a deterministic fallback path
+- transcript generation is handled by the OpenAI transcription API through `backend/app/streaming/stt_adapter.py`, using `STREAMING_STT_MODEL` and the existing `OPENAI_API_KEY`
 - outbound TTS is still a placeholder, so this path does not yet speak generated replies back to the caller
 - the current `/voice` path remains the primary path and is unchanged
 

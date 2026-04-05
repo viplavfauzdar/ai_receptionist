@@ -1,5 +1,7 @@
 import base64
 import importlib
+import io
+import wave
 
 
 ai_module = importlib.import_module("app.ai")
@@ -26,6 +28,17 @@ def test_mulaw_to_pcm16_and_resample_boundaries():
     assert len(pcm_16khz) == 8
 
 
+def test_build_wav_file_bytes_wraps_pcm_with_expected_format():
+    wav_bytes = stt_module.build_wav_file_bytes(b"\x01\x00\x02\x00")
+
+    assert wav_bytes.startswith(b"RIFF")
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == 16000
+        assert wav_file.readframes(2) == b"\x01\x00\x02\x00"
+
+
 def test_streaming_session_audio_buffering_consumes_threshold_chunks():
     session = session_module.StreamingSession(stream_sid="MZ-buffer")
 
@@ -39,6 +52,42 @@ def test_streaming_session_audio_buffering_consumes_threshold_chunks():
     assert bytes(session.audio_buffer) == b"b" * 20
     assert session.media_chunk_count == 1
     assert session.total_audio_bytes == 80
+
+
+def test_openai_streaming_stt_provider_calls_transcriptions_api(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeTranscriptions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return type("Resp", (), {"text": " hello world "})()
+
+    fake_client = type("FakeClient", (), {"audio": type("Audio", (), {"transcriptions": _FakeTranscriptions()})()})()
+    provider = stt_module.OpenAIStreamingSTTProvider(client=fake_client)
+    monkeypatch.setattr(stt_module.settings, "streaming_stt_model", "gpt-4o-mini-transcribe")
+
+    transcript = provider.transcribe_pcm16(b"\x01\x00\x02\x00")
+
+    assert transcript == "hello world"
+    assert captured["model"] == "gpt-4o-mini-transcribe"
+    assert captured["timeout"] == 10.0
+    uploaded_file = captured["file"]
+    assert getattr(uploaded_file, "name", "") == "streaming_chunk.wav"
+    assert uploaded_file.read(4) == b"RIFF"
+
+
+def test_openai_streaming_stt_provider_returns_none_without_key_or_text(monkeypatch):
+    provider = stt_module.OpenAIStreamingSTTProvider(client=None)
+    monkeypatch.setattr(stt_module.settings, "openai_api_key", "")
+    assert provider.transcribe_pcm16(b"\x01\x00") is None
+
+    class _FakeTranscriptions:
+        def create(self, **kwargs):
+            return type("Resp", (), {"text": "   "})()
+
+    fake_client = type("FakeClient", (), {"audio": type("Audio", (), {"transcriptions": _FakeTranscriptions()})()})()
+    provider = stt_module.OpenAIStreamingSTTProvider(client=fake_client)
+    assert provider.transcribe_pcm16(b"\x01\x00") is None
 
 
 def test_streaming_voice_bridge_uses_existing_conversational_logic(monkeypatch):
