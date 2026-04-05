@@ -120,6 +120,8 @@ def test_streaming_voice_bridge_uses_existing_conversational_logic(monkeypatch):
     reply_plan = voice_module.maybe_transcript_to_reply(session, "I want to book an appointment")
 
     assert reply_plan.reply_text == "Sure, I can help schedule that. What day works for you?"
+    assert reply_plan.intent == "BOOK_APPOINTMENT"
+    assert reply_plan.fallback_used is True
     assert session.current_intent == "BOOK_APPOINTMENT"
     assert session.current_state == "COLLECTING_APPOINTMENT_DAY"
     assert session.transcript == [
@@ -144,3 +146,26 @@ def test_streaming_tts_adapter_converts_provider_pcm_to_mulaw(monkeypatch):
 
     assert mulaw is not None
     assert len(mulaw) == 3
+
+
+def test_streaming_voice_bridge_short_booking_transcript_enters_booking_flow():
+    session = session_module.StreamingSession(stream_sid="MZ-short", call_sid="CA-short")
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "appointment")
+
+    assert reply_plan.intent == "BOOK_APPOINTMENT"
+    assert reply_plan.reply_text == "Sure, I can help schedule that. What day works for you?"
+    assert reply_plan.reply_text != "Sorry, I didn't catch that. Could you say that again?"
+    assert session.current_intent == "BOOK_APPOINTMENT"
+    assert session.current_state == "COLLECTING_APPOINTMENT_DAY"
+
+
+def test_streaming_voice_bridge_empty_transcript_repompts_instead_of_reset():
+    session = session_module.StreamingSession(stream_sid="MZ-empty", call_sid="CA-empty")
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "   ")
+
+    assert reply_plan.intent == "GENERAL_QUESTION"
+    assert reply_plan.reply_text == "Sorry, I didn't catch that. Could you say that again?"
+    assert reply_plan.fallback_used is True
+    assert session.last_reply_text == "Sorry, I didn't catch that. Could you say that again?"

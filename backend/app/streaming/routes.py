@@ -17,7 +17,7 @@ streaming_router = APIRouter()
 streaming_session_store = StreamingSessionStore()
 stt_adapter = StreamingSTTAdapter()
 tts_adapter = StreamingTTSAdapter()
-TRANSCRIBE_BUFFER_BYTES = 32000
+TRANSCRIBE_BUFFER_BYTES = 6400
 
 
 def _log_streaming(message: str) -> None:
@@ -151,14 +151,20 @@ async def media_stream(websocket: WebSocket):
                             f"event=transcript stream_sid={session.stream_sid} "
                             f"call_sid={session.call_sid} transcript={transcript_text!r}"
                         )
+                    else:
+                        _log_streaming(
+                            f"event=transcript stream_sid={session.stream_sid} "
+                            f"call_sid={session.call_sid} transcript=None"
+                        )
                 reply_plan = maybe_transcript_to_reply(session, transcript_text)
                 await websocket.send_json(
                     _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="media-received")
                 )
                 if reply_plan.reply_text:
                     _log_streaming(
-                        f"event=reply stream_sid={session.stream_sid} "
-                        f"call_sid={session.call_sid} reply={reply_plan.reply_text!r}"
+                        f"event=reply stream_sid={session.stream_sid} call_sid={session.call_sid} "
+                        f"intent={reply_plan.intent} fallback_used={str(reply_plan.fallback_used).lower()} "
+                        f"reply={reply_plan.reply_text!r}"
                     )
                     try:
                         audio_bytes = tts_adapter.synthesize_mulaw(reply_plan.reply_text)

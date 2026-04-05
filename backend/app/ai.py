@@ -285,7 +285,7 @@ def _default_response_for_intent(intent: str, business: BusinessContext, slot_da
         if slot_data.get("callback_number"):
             return "Thanks. What name should I put on that callback request?"
         return "I can have someone call you back. What number should we use?"
-    return "Thanks for calling. How can I help you today?"
+    return "Sorry, I didn't catch that. Could you say that again?"
 
 
 def _normalize_intent(intent: object) -> str | None:
@@ -390,7 +390,7 @@ def _fallback_result(
     return ReceptionistResult(
         intent=intent,
         state="GENERAL_ASSISTANCE",
-        response="Thanks for calling. How can I help you today?",
+        response="Sorry, I didn't catch that. Could you say that again?",
         fields=fields,
     )
 

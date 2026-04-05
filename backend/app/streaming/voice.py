@@ -9,17 +9,27 @@ from .session import StreamingSession
 @dataclass
 class StreamingReplyPlan:
     transcript_text: str | None
+    intent: str | None
     reply_text: str | None
+    fallback_used: bool
 
 
 def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | None) -> StreamingReplyPlan:
-    session.last_transcript_text = transcript_text
-    if not transcript_text:
-        return StreamingReplyPlan(transcript_text=None, reply_text=None)
+    normalized_transcript = " ".join((transcript_text or "").split()).strip()
+    session.last_transcript_text = normalized_transcript or None
+    if not normalized_transcript:
+        reply_text = "Sorry, I didn't catch that. Could you say that again?"
+        session.last_reply_text = reply_text
+        return StreamingReplyPlan(
+            transcript_text=None,
+            intent="GENERAL_QUESTION",
+            reply_text=reply_text,
+            fallback_used=True,
+        )
 
-    session.transcript.append({"role": "caller", "text": transcript_text})
+    session.transcript.append({"role": "caller", "text": normalized_transcript})
     result = detect_and_respond(
-        transcript_text,
+        normalized_transcript,
         business=BusinessContext(),
         session=SessionContext(
             call_sid=session.call_sid,
@@ -36,4 +46,9 @@ def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | 
     reply_text = result.response
     session.transcript.append({"role": "assistant", "text": reply_text})
     session.last_reply_text = reply_text
-    return StreamingReplyPlan(transcript_text=transcript_text, reply_text=reply_text)
+    return StreamingReplyPlan(
+        transcript_text=normalized_transcript,
+        intent=result.intent,
+        reply_text=reply_text,
+        fallback_used=True,
+    )
