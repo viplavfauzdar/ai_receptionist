@@ -126,3 +126,21 @@ def test_streaming_voice_bridge_uses_existing_conversational_logic(monkeypatch):
         {"role": "caller", "text": "I want to book an appointment"},
         {"role": "assistant", "text": "Sure, I can help schedule that. What day works for you?"},
     ]
+
+
+def test_streaming_tts_adapter_converts_provider_pcm_to_mulaw(monkeypatch):
+    class _FakeProvider:
+        def synthesize_pcm16(self, reply_text: str) -> bytes | None:
+            assert reply_text == "Hello there"
+            return (
+                b"\x10\x00\x20\x00\x30\x00"
+                b"\x40\x00\x50\x00\x60\x00"
+                b"\x70\x00\x80\x00\x90\x00"
+            )
+
+    adapter = importlib.import_module("app.streaming.tts_adapter").StreamingTTSAdapter(provider=_FakeProvider())
+
+    mulaw = adapter.synthesize_mulaw("Hello there")
+
+    assert mulaw is not None
+    assert len(mulaw) == 3

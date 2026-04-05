@@ -245,12 +245,13 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - Twilio webhook: `POST /voice-stream`
 - WebSocket endpoint: `/ws/media-stream`
 - TwiML uses `<Connect><Stream>` so Twilio opens one bidirectional WebSocket per call
-- the call starts with a short spoken greeting before the stream connection begins, so the caller does not experience dead air
+- the call starts with a short receptionist greeting based on the business name before the stream connection begins, so the caller does not experience dead air
 - current implementation decodes inbound Twilio mu-law frames, converts them to PCM, upsamples from 8kHz to 16kHz, buffers short chunks for STT, and passes any transcript text into the existing assistant logic on a deterministic fallback path
 - transcript generation is handled by the OpenAI transcription API through `backend/app/streaming/stt_adapter.py`, using `STREAMING_STT_MODEL` and the existing `OPENAI_API_KEY`
 - audio is decoded from Twilio base64 mu-law, converted to mono PCM16, resampled from 8kHz to 16kHz, wrapped as a mono 16-bit 16kHz WAV, and only sent to STT once about 1 second of PCM audio is buffered (`32000` bytes)
 - if transcription fails, the chunk is discarded, the error is logged, and the WebSocket session stays alive
-- outbound TTS is still a placeholder, so this path does not yet speak generated replies back to the caller
+- reply text is now sent through `backend/app/streaming/tts_adapter.py`, synthesized to PCM, converted to Twilio-compatible mu-law 8k audio, and returned over the bidirectional stream as outbound `media` messages
+- if TTS fails, the error is logged and the WebSocket session stays alive
 - the current `/voice` path remains the primary path and is unchanged
 
 Implementation lives under:
@@ -283,7 +284,7 @@ https://YOUR-NGROK-URL/voice-stream
 wss://YOUR-NGROK-URL/ws/media-stream
 ```
 
-This path is currently inbound-audio only. It can now decode and buffer Twilio audio and hand transcript text into the existing receptionist logic, but outbound TTS is still a placeholder and it does not replace the main receptionist flow yet.
+This path is now a minimal full loop: inbound Twilio audio, transcript generation, reply text generation, and outbound streamed speech. It is still experimental and does not replace the main receptionist flow yet.
 
 Example 3-turn booking flow:
 1. Caller: `I want to book an appointment`

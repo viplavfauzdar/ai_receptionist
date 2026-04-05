@@ -13,6 +13,7 @@ def _parse_xml(text: str) -> ET.Element:
 
 def test_voice_stream_returns_connect_stream_twiml(client, monkeypatch):
     monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
+    monkeypatch.setattr(streaming_module.settings, "business_name", "Bright Smile Dental")
     streaming_module.streaming_session_store._sessions.clear()
 
     res = client.post(
@@ -24,7 +25,7 @@ def test_voice_stream_returns_connect_stream_twiml(client, monkeypatch):
     xml = _parse_xml(res.text)
     say = xml.find("Say")
     assert say is not None
-    assert say.text == "Welcome. Please hold while I connect you."
+    assert say.text == "Hi, Bright Smile Dental. How can I help?"
     connect = xml.find("Connect")
     assert connect is not None
     stream = connect.find("Stream")
@@ -129,6 +130,11 @@ def test_media_stream_transcribes_buffered_audio_and_updates_session(client, mon
         "transcribe_buffer",
         lambda session, audio_chunk: "What are your hours?" if audio_chunk else None,
     )
+    monkeypatch.setattr(
+        streaming_module.tts_adapter,
+        "synthesize_mulaw",
+        lambda reply_text: b"\x01\x02" if reply_text else None,
+    )
     monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 640)
 
     payload = b64encode(b"\xff" * 160).decode("ascii")
@@ -158,6 +164,12 @@ def test_media_stream_transcribes_buffered_audio_and_updates_session(client, mon
         )
         media_ack = websocket.receive_json()
         assert media_ack["mark"]["name"] == "media-received"
+        outbound_media = websocket.receive_json()
+        assert outbound_media["event"] == "media"
+        assert outbound_media["streamSid"] == "MZ-transcribe"
+        assert outbound_media["media"]["payload"] == b64encode(b"\x01\x02").decode("ascii")
+        reply_ack = websocket.receive_json()
+        assert reply_ack["mark"]["name"] == "reply-sent"
 
         session = streaming_module.streaming_session_store.get("MZ-transcribe")
         assert session is not None
@@ -259,6 +271,65 @@ def test_media_stream_survives_stt_failure_and_keeps_session_alive(client, monke
                     "event": "mark",
                     "streamSid": "MZ-stt-error",
                     "mark": {"name": "after-error"},
+                }
+            )
+        )
+        mark_ack = websocket.receive_json()
+        assert mark_ack["mark"]["name"] == "mark-received"
+
+
+def test_media_stream_survives_tts_failure_and_keeps_session_alive(client, monkeypatch):
+    monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
+    streaming_module.streaming_session_store._sessions.clear()
+    monkeypatch.setattr(
+        streaming_module.stt_adapter,
+        "transcribe_buffer",
+        lambda session, audio_chunk: "Can I book an appointment?" if audio_chunk else None,
+    )
+    monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 640)
+
+    def _failing_tts(reply_text):
+        raise RuntimeError("tts unavailable")
+
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", _failing_tts)
+    payload = b64encode(b"\xff" * 160).decode("ascii")
+
+    with client.websocket_connect("/ws/media-stream") as websocket:
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ-tts-error",
+                        "callSid": "CA-tts-error",
+                        "customParameters": {},
+                    },
+                }
+            )
+        )
+        websocket.receive_json()
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "media",
+                    "streamSid": "MZ-tts-error",
+                    "media": {"payload": payload},
+                }
+            )
+        )
+        media_ack = websocket.receive_json()
+        assert media_ack["mark"]["name"] == "media-received"
+
+        session = streaming_module.streaming_session_store.get("MZ-tts-error")
+        assert session is not None
+        assert session.last_reply_text is not None
+
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "mark",
+                    "streamSid": "MZ-tts-error",
+                    "mark": {"name": "after-tts-error"},
                 }
             )
         )

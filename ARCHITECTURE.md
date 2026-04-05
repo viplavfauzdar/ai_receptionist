@@ -107,7 +107,7 @@ Key modules:
 The streaming path is intentionally isolated from the main receptionist flow.
 
 - `POST /voice-stream` returns TwiML with `<Connect><Stream>`
-- that TwiML starts with a short `<Say>` greeting so the experimental path does not begin with silence
+- that TwiML starts with a short `<Say>` receptionist greeting derived from the configured business name so the experimental path does not begin with silence
 - `/ws/media-stream` accepts Twilio Media Streams WebSocket messages
 - inbound `media` frames are decoded from base64 mu-law, converted to 16-bit PCM, upsampled to 16kHz, buffered, and passed through a narrow STT boundary
 - the streaming STT adapter wraps buffered audio as a mono 16-bit 16kHz WAV before calling the OpenAI transcription API
@@ -115,7 +115,8 @@ The streaming path is intentionally isolated from the main receptionist flow.
 - transcription exceptions are handled inside the streaming route so a bad chunk does not terminate the WebSocket session
 - the current STT provider for that boundary is the OpenAI transcription API, configured by `OPENAI_API_KEY` plus `STREAMING_STT_MODEL`
 - when transcript text is produced, the streaming bridge passes it into the existing receptionist logic on a deterministic fallback path
-- outbound TTS is still a placeholder, so replies are generated logically but not yet spoken back over the stream
+- reply text then flows through the streaming TTS adapter, which synthesizes audio and converts it to Twilio-compatible mu-law payloads for outbound `media` messages
+- TTS exceptions are logged and do not terminate the WebSocket session
 - the existing `POST /voice` path remains the primary production path for booking, calendar, and current receptionist behavior
 - this streaming path is the future direction for lower-latency voice once STT, LLM, and TTS adapters are plugged in
 

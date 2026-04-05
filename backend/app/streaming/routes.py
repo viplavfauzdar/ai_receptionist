@@ -31,9 +31,19 @@ def _build_stream_websocket_url(request: Request) -> str:
     return f"{ws_scheme}://{host}{settings.streaming_ws_path}"
 
 
+def _build_streaming_greeting_text() -> str:
+    business_name = settings.business_name.strip()
+    if business_name:
+        return f"Hi, {business_name}. How can I help?"
+    greeting = " ".join(settings.business_greeting.split()).strip()
+    if greeting:
+        return greeting
+    return "Hi. How can I help?"
+
+
 def _build_streaming_twiml(request: Request) -> str:
     response = VoiceResponse()
-    response.say("Welcome. Please hold while I connect you.")
+    response.say(_build_streaming_greeting_text())
     connect = Connect()
     stream = Stream(url=_build_stream_websocket_url(request))
     stream.append(Parameter(name="route", value="experimental-stream"))
@@ -121,6 +131,10 @@ async def media_stream(websocket: WebSocket):
                 raw_audio = stt_adapter.decode_payload_to_pcm16_16khz(raw_payload)
                 session.record_media_chunk(len(raw_audio) // 4 if raw_audio else 0)
                 session.append_audio_bytes(raw_audio)
+                _log_streaming(
+                    f"event=media stream_sid={session.stream_sid} call_sid={session.call_sid} "
+                    f"raw_payload_bytes={len(raw_payload)} pcm_bytes={len(raw_audio)}"
+                )
                 transcript_text = None
                 audio_chunk = session.consume_audio_chunk(TRANSCRIBE_BUFFER_BYTES)
                 if audio_chunk:
@@ -142,9 +156,24 @@ async def media_stream(websocket: WebSocket):
                     _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="media-received")
                 )
                 if reply_plan.reply_text:
-                    audio_bytes = tts_adapter.synthesize_mulaw(reply_plan.reply_text)
+                    _log_streaming(
+                        f"event=reply stream_sid={session.stream_sid} "
+                        f"call_sid={session.call_sid} reply={reply_plan.reply_text!r}"
+                    )
+                    try:
+                        audio_bytes = tts_adapter.synthesize_mulaw(reply_plan.reply_text)
+                    except Exception as exc:
+                        _log_streaming(
+                            f"event=tts_error stream_sid={session.stream_sid} "
+                            f"call_sid={session.call_sid} error={exc}"
+                        )
+                        audio_bytes = None
                     if audio_bytes:
                         await websocket.send_json(_build_outbound_media_message(stream_sid=session.stream_sid, audio_bytes=audio_bytes))
+                        _log_streaming(
+                            f"event=outbound_audio stream_sid={session.stream_sid} "
+                            f"call_sid={session.call_sid} audio_bytes={len(audio_bytes)}"
+                        )
                         await websocket.send_json(
                             _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="reply-sent")
                         )
