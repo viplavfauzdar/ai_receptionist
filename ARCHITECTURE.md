@@ -92,7 +92,7 @@ Key modules:
 - `backend/app/streaming/stt_adapter.py`
   Twilio mu-law decode, PCM conversion, 8kHz-to-16kHz upsampling, WAV wrapping, and OpenAI-backed STT boundary.
 - `backend/app/streaming/tts_adapter.py`
-  Placeholder streaming TTS boundary.
+  Streaming TTS boundary that synthesizes PCM, converts it to Twilio-compatible mono 8kHz mu-law, and returns outbound media payload bytes.
 - `backend/app/models.py`
   SQLAlchemy ORM models.
 - `backend/app/db.py`
@@ -107,17 +107,19 @@ Key modules:
 The streaming path is intentionally isolated from the main receptionist flow.
 
 - `POST /voice-stream` returns TwiML with `<Connect><Stream>`
-- that TwiML starts with a short `<Say>` receptionist greeting derived from the configured business name so the experimental path does not begin with silence
+- that TwiML no longer uses `<Say>`; instead, after the WebSocket `start` event the backend sends the initial business-aware greeting through the same outbound TTS/media path used for assistant replies so the voice stays consistent
 - `/ws/media-stream` accepts Twilio Media Streams WebSocket messages
 - inbound `media` frames are decoded from base64 mu-law, converted to 16-bit PCM, upsampled to 16kHz, buffered, and passed through a narrow STT boundary
 - the streaming STT adapter wraps buffered audio as a mono 16-bit 16kHz WAV before calling the OpenAI transcription API
-- the route waits for roughly 1.5 seconds of PCM audio (`48000` bytes) before attempting transcription, to avoid tiny invalid audio uploads
+- the route uses a configurable STT threshold via `STREAMING_STT_BUFFER_BYTES`, currently `32000` bytes of 16kHz PCM16, to avoid tiny invalid audio uploads while still allowing short phrases to be transcribed
 - a short playback gate suppresses STT buffering while outbound audio is being played back, reducing self-transcription
 - low-energy PCM chunks are skipped before STT invocation
+- if the caller hangs up with buffered audio still waiting below threshold, the route performs one final STT flush on the Twilio `stop` event before removing the session
 - transcription exceptions are handled inside the streaming route so a bad chunk does not terminate the WebSocket session
 - the current STT provider for that boundary is the OpenAI transcription API, configured by `OPENAI_API_KEY` plus `STREAMING_STT_MODEL`
 - when transcript text is produced, the streaming bridge passes it into the existing receptionist logic on a deterministic fallback path
 - reply text then flows through the streaming TTS adapter, which synthesizes audio and converts it to Twilio-compatible mu-law payloads for outbound `media` messages
+- outbound audio is sent back as base64-encoded Twilio `media` payloads containing mono 8kHz mu-law audio
 - TTS exceptions are logged and do not terminate the WebSocket session
 - the existing `POST /voice` path remains the primary production path for booking, calendar, and current receptionist behavior
 - this streaming path is the future direction for lower-latency voice once STT, LLM, and TTS adapters are plugged in

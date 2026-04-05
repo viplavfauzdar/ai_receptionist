@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from io import BytesIO
-
 from openai import OpenAI
 
 from ..config import settings
@@ -24,13 +22,24 @@ def resample_pcm16le_24khz_to_8khz(audio_bytes: bytes) -> bytes:
 
 
 def _linear_to_mulaw_sample(sample: int) -> int:
-    mu = 255
-    max_val = 32768.0
-    normalized = max(-1.0, min(1.0, sample / max_val))
-    magnitude = abs(normalized)
-    companded = (1 if normalized >= 0 else -1) * (pow(1 + mu, magnitude) - 1) / mu
-    encoded = int((companded + 1) / 2 * 255)
-    return max(0, min(255, encoded))
+    bias = 0x84
+    clip = 32635
+    sign = 0
+    if sample < 0:
+        sign = 0x80
+        sample = -sample
+    if sample > clip:
+        sample = clip
+    sample += bias
+
+    exponent = 7
+    mask = 0x4000
+    while exponent > 0 and (sample & mask) == 0:
+        exponent -= 1
+        mask >>= 1
+
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    return (~(sign | (exponent << 4) | mantissa)) & 0xFF
 
 
 def pcm16le_to_mulaw_8khz(audio_bytes: bytes) -> bytes:

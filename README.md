@@ -96,6 +96,7 @@ OPENAI_MODEL=gpt-4o-mini
 ENABLE_STREAMING_VOICE_EXPERIMENT=false
 STREAMING_WS_PATH=/ws/media-stream
 STREAMING_VOICE_ROUTE=/voice-stream
+STREAMING_STT_BUFFER_BYTES=32000
 MAX_CALL_TURNS=12
 MAX_LLM_CALLS_PER_SESSION=6
 ENABLE_BASIC_RATE_LIMITING=true
@@ -185,6 +186,7 @@ Backend `.env`:
 - `ENABLE_STREAMING_VOICE_EXPERIMENT=false`
 - `STREAMING_WS_PATH=/ws/media-stream`
 - `STREAMING_VOICE_ROUTE=/voice-stream`
+- `STREAMING_STT_BUFFER_BYTES=32000`
 - `MAX_CALL_TURNS=12`
 - `MAX_LLM_CALLS_PER_SESSION=6`
 - `ENABLE_BASIC_RATE_LIMITING=true`
@@ -245,14 +247,15 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - Twilio webhook: `POST /voice-stream`
 - WebSocket endpoint: `/ws/media-stream`
 - TwiML uses `<Connect><Stream>` so Twilio opens one bidirectional WebSocket per call
-- the call starts with a short receptionist greeting based on the business name before the stream connection begins, so the caller does not experience dead air
+- `/voice-stream` no longer uses TwiML `<Say>` for the greeting; after the WebSocket `start` event the backend sends the initial business-aware greeting through the same outbound TTS/media path used for assistant replies, so the voice stays consistent
 - current implementation decodes inbound Twilio mu-law frames, converts them to PCM, upsamples from 8kHz to 16kHz, buffers short chunks for STT, and passes any transcript text into the existing assistant logic on a deterministic fallback path
 - transcript generation is handled by the OpenAI transcription API through `backend/app/streaming/stt_adapter.py`, using `STREAMING_STT_MODEL` and the existing `OPENAI_API_KEY`
 - audio is decoded from Twilio base64 mu-law, converted to mono PCM16, resampled from 8kHz to 16kHz, wrapped as a mono 16-bit 16kHz WAV, and only sent to STT once about 1 second of PCM audio is buffered (`32000` bytes)
-- the streaming path now waits for about 1.5 seconds of PCM audio (`48000` bytes) before STT and skips obviously low-energy chunks
+- the STT threshold is configurable with `STREAMING_STT_BUFFER_BYTES`; the current default is `32000` bytes of 16kHz PCM16
 - inbound media is temporarily gated from STT while outbound TTS audio is being played, to reduce self-transcription and repeated fallback replies
+- if the caller hangs up with buffered audio still waiting below threshold, the route performs one final STT flush on the Twilio `stop` event before the stream session closes
 - if transcription fails, the chunk is discarded, the error is logged, and the WebSocket session stays alive
-- reply text is now sent through `backend/app/streaming/tts_adapter.py`, synthesized to PCM, converted to Twilio-compatible mu-law 8k audio, and returned over the bidirectional stream as outbound `media` messages
+- reply text is sent through `backend/app/streaming/tts_adapter.py`, synthesized to PCM, converted to Twilio-compatible mono 8kHz mu-law audio, base64 encoded, and returned over the bidirectional stream as outbound `media` messages
 - if TTS fails, the error is logged and the WebSocket session stays alive
 - the current `/voice` path remains the primary path and is unchanged
 

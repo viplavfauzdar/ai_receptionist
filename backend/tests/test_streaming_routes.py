@@ -1,7 +1,7 @@
 import importlib
 import json
 import xml.etree.ElementTree as ET
-from base64 import b64encode
+from base64 import b64decode, b64encode
 
 
 streaming_module = importlib.import_module("app.streaming.routes")
@@ -24,8 +24,7 @@ def test_voice_stream_returns_connect_stream_twiml(client, monkeypatch):
     assert res.status_code == 200
     xml = _parse_xml(res.text)
     say = xml.find("Say")
-    assert say is not None
-    assert say.text == "Hi, Bright Smile Dental. How can I help?"
+    assert say is None
     connect = xml.find("Connect")
     assert connect is not None
     stream = connect.find("Stream")
@@ -36,6 +35,7 @@ def test_voice_stream_returns_connect_stream_twiml(client, monkeypatch):
 def test_media_stream_websocket_accepts_twilio_message_sequence(client, monkeypatch):
     monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
     streaming_module.streaming_session_store._sessions.clear()
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", lambda reply_text: b"\x01\x02")
 
     with client.websocket_connect("/ws/media-stream") as websocket:
         websocket.send_text(json.dumps({"event": "connected", "protocol": "Call", "version": "1.0.0"}))
@@ -55,6 +55,11 @@ def test_media_stream_websocket_accepts_twilio_message_sequence(client, monkeypa
         start_ack = websocket.receive_json()
         assert start_ack["event"] == "mark"
         assert start_ack["mark"]["name"] == "stream-started"
+        greeting_media = websocket.receive_json()
+        assert greeting_media["event"] == "media"
+        assert b64decode(greeting_media["media"]["payload"]) == b"\x01\x02"
+        greeting_ack = websocket.receive_json()
+        assert greeting_ack["mark"]["name"] == "greeting-sent"
         websocket.send_text(
             json.dumps(
                 {
@@ -101,6 +106,7 @@ def test_media_stream_websocket_accepts_twilio_message_sequence(client, monkeypa
 def test_media_stream_disconnect_cleans_up_session(client, monkeypatch):
     monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
     streaming_module.streaming_session_store._sessions.clear()
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", lambda reply_text: b"\x01\x02")
 
     with client.websocket_connect("/ws/media-stream") as websocket:
         websocket.send_text(
@@ -154,6 +160,11 @@ def test_media_stream_transcribes_buffered_audio_and_updates_session(client, mon
             )
         )
         websocket.receive_json()
+        websocket.receive_json()
+        websocket.receive_json()
+        session = streaming_module.streaming_session_store.get("MZ-transcribe")
+        assert session is not None
+        session.playback_gate_until = session.created_at
         websocket.send_text(
             json.dumps(
                 {
@@ -184,6 +195,7 @@ def test_media_stream_does_not_call_stt_for_tiny_audio_chunks(client, monkeypatc
     monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
     streaming_module.streaming_session_store._sessions.clear()
     monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 32000)
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", lambda reply_text: b"\x01\x02")
     call_count = {"count": 0}
 
     def _fake_transcribe(session, audio_chunk):
@@ -208,6 +220,11 @@ def test_media_stream_does_not_call_stt_for_tiny_audio_chunks(client, monkeypatc
             )
         )
         websocket.receive_json()
+        websocket.receive_json()
+        websocket.receive_json()
+        session = streaming_module.streaming_session_store.get("MZ-tiny")
+        assert session is not None
+        session.playback_gate_until = session.created_at
         websocket.send_text(
             json.dumps(
                 {
@@ -230,6 +247,7 @@ def test_media_stream_ignores_inbound_audio_while_playback_gate_is_active(client
     monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
     streaming_module.streaming_session_store._sessions.clear()
     monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 640)
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", lambda reply_text: b"\x01\x02")
     call_count = {"count": 0}
 
     def _fake_transcribe(session, audio_chunk):
@@ -253,6 +271,8 @@ def test_media_stream_ignores_inbound_audio_while_playback_gate_is_active(client
                 }
             )
         )
+        websocket.receive_json()
+        websocket.receive_json()
         websocket.receive_json()
         session = streaming_module.streaming_session_store.get("MZ-gated")
         assert session is not None
@@ -278,6 +298,7 @@ def test_media_stream_skips_low_energy_audio(client, monkeypatch):
     monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
     streaming_module.streaming_session_store._sessions.clear()
     monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 640)
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", lambda reply_text: b"\x01\x02")
     call_count = {"count": 0}
 
     def _fake_transcribe(session, audio_chunk):
@@ -302,6 +323,11 @@ def test_media_stream_skips_low_energy_audio(client, monkeypatch):
             )
         )
         websocket.receive_json()
+        websocket.receive_json()
+        websocket.receive_json()
+        session = streaming_module.streaming_session_store.get("MZ-low-energy")
+        assert session is not None
+        session.playback_gate_until = session.created_at
         websocket.send_text(
             json.dumps(
                 {
@@ -324,6 +350,7 @@ def test_media_stream_survives_stt_failure_and_keeps_session_alive(client, monke
     monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
     streaming_module.streaming_session_store._sessions.clear()
     monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 640)
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", lambda reply_text: b"\x01\x02")
     monkeypatch.setattr(streaming_module.stt_adapter, "is_low_energy_pcm16", lambda audio_chunk: False)
 
     def _failing_transcribe(session, audio_chunk):
@@ -346,6 +373,11 @@ def test_media_stream_survives_stt_failure_and_keeps_session_alive(client, monke
             )
         )
         websocket.receive_json()
+        websocket.receive_json()
+        websocket.receive_json()
+        session = streaming_module.streaming_session_store.get("MZ-stt-error")
+        assert session is not None
+        session.playback_gate_until = session.created_at
         websocket.send_text(
             json.dumps(
                 {
@@ -405,7 +437,11 @@ def test_media_stream_survives_tts_failure_and_keeps_session_alive(client, monke
                 }
             )
         )
-        websocket.receive_json()
+        start_ack = websocket.receive_json()
+        assert start_ack["mark"]["name"] == "stream-started"
+        session = streaming_module.streaming_session_store.get("MZ-tts-error")
+        assert session is not None
+        session.playback_gate_until = session.created_at
         websocket.send_text(
             json.dumps(
                 {
@@ -433,3 +469,60 @@ def test_media_stream_survives_tts_failure_and_keeps_session_alive(client, monke
         )
         mark_ack = websocket.receive_json()
         assert mark_ack["mark"]["name"] == "mark-received"
+
+
+def test_media_stream_stop_flushes_remaining_audio_to_stt(client, monkeypatch):
+    monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
+    streaming_module.streaming_session_store._sessions.clear()
+    monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 32000)
+    monkeypatch.setattr(streaming_module.tts_adapter, "synthesize_mulaw", lambda reply_text: b"\x01\x02")
+    captured = {"count": 0}
+
+    def _fake_transcribe(session, audio_chunk):
+        captured["count"] += 1
+        return "appointment"
+
+    monkeypatch.setattr(streaming_module.stt_adapter, "transcribe_buffer", _fake_transcribe)
+    monkeypatch.setattr(streaming_module.stt_adapter, "is_low_energy_pcm16", lambda audio_chunk: False)
+    payload = b64encode(b"\xff" * 160).decode("ascii")
+
+    with client.websocket_connect("/ws/media-stream") as websocket:
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ-stop-flush",
+                        "callSid": "CA-stop-flush",
+                        "customParameters": {},
+                    },
+                }
+            )
+        )
+        websocket.receive_json()
+        websocket.receive_json()
+        websocket.receive_json()
+        session = streaming_module.streaming_session_store.get("MZ-stop-flush")
+        assert session is not None
+        session.playback_gate_until = session.created_at
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "media",
+                    "streamSid": "MZ-stop-flush",
+                    "media": {"payload": payload},
+                }
+            )
+        )
+        media_ack = websocket.receive_json()
+        assert media_ack["mark"]["name"] == "media-received"
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "stop",
+                    "stop": {"streamSid": "MZ-stop-flush", "callSid": "CA-stop-flush"},
+                }
+            )
+        )
+
+    assert captured["count"] == 1

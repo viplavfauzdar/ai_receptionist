@@ -2,6 +2,7 @@ import base64
 import importlib
 import io
 import wave
+from base64 import b64decode
 
 
 ai_module = importlib.import_module("app.ai")
@@ -162,6 +163,7 @@ def test_streaming_tts_adapter_converts_provider_pcm_to_mulaw(monkeypatch):
 
     assert mulaw is not None
     assert len(mulaw) == 3
+    assert mulaw != b"\x00\x00\x00"
 
 
 def test_streaming_voice_bridge_short_booking_transcript_enters_booking_flow():

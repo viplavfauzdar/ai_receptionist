@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     streaming_stt_model: str = "gpt-4o-mini-transcribe"
+    streaming_stt_buffer_bytes: int = 32000
     streaming_tts_model: str = "gpt-4o-mini-tts"
     streaming_tts_voice: str = "alloy"
     enable_streaming_voice_experiment: bool = False
