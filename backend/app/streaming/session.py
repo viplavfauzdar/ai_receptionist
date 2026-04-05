@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 import base64
 
 
@@ -23,6 +23,7 @@ class StreamingSession:
     transcript: list[dict[str, str]] = field(default_factory=list)
     last_transcript_text: str | None = None
     last_reply_text: str | None = None
+    playback_gate_until: datetime | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -60,6 +61,23 @@ class StreamingSession:
         del self.audio_buffer[:minimum_bytes]
         self.updated_at = datetime.utcnow()
         return chunk
+
+    def clear_audio_buffer(self) -> None:
+        self.audio_buffer.clear()
+        self.updated_at = datetime.utcnow()
+
+    def activate_playback_gate(self, duration_seconds: float) -> None:
+        self.playback_gate_until = datetime.utcnow() + timedelta(seconds=max(duration_seconds, 0))
+        self.clear_audio_buffer()
+        self.updated_at = datetime.utcnow()
+
+    def is_playback_gate_active(self) -> bool:
+        if self.playback_gate_until is None:
+            return False
+        if datetime.utcnow() >= self.playback_gate_until:
+            self.playback_gate_until = None
+            return False
+        return True
 
 
 class StreamingSessionStore:

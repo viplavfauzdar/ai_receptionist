@@ -17,7 +17,8 @@ streaming_router = APIRouter()
 streaming_session_store = StreamingSessionStore()
 stt_adapter = StreamingSTTAdapter()
 tts_adapter = StreamingTTSAdapter()
-TRANSCRIBE_BUFFER_BYTES = 6400
+TRANSCRIBE_BUFFER_BYTES = 48000
+PLAYBACK_GATE_SECONDS = 2.5
 
 
 def _log_streaming(message: str) -> None:
@@ -130,36 +131,66 @@ async def media_stream(websocket: WebSocket):
                 raw_payload = str(media.get("payload") or "")
                 raw_audio = stt_adapter.decode_payload_to_pcm16_16khz(raw_payload)
                 session.record_media_chunk(len(raw_audio) // 4 if raw_audio else 0)
-                session.append_audio_bytes(raw_audio)
                 _log_streaming(
                     f"event=media stream_sid={session.stream_sid} call_sid={session.call_sid} "
                     f"raw_payload_bytes={len(raw_payload)} pcm_bytes={len(raw_audio)}"
                 )
-                transcript_text = None
-                audio_chunk = session.consume_audio_chunk(TRANSCRIBE_BUFFER_BYTES)
-                if audio_chunk:
-                    try:
-                        transcript_text = stt_adapter.transcribe_buffer(session, audio_chunk)
-                    except Exception as exc:
-                        _log_streaming(
-                            f"event=stt_error stream_sid={session.stream_sid} "
-                            f"call_sid={session.call_sid} error={exc}"
-                        )
-                        transcript_text = None
-                    if transcript_text:
-                        _log_streaming(
-                            f"event=transcript stream_sid={session.stream_sid} "
-                            f"call_sid={session.call_sid} transcript={transcript_text!r}"
-                        )
-                    else:
-                        _log_streaming(
-                            f"event=transcript stream_sid={session.stream_sid} "
-                            f"call_sid={session.call_sid} transcript=None"
-                        )
-                reply_plan = maybe_transcript_to_reply(session, transcript_text)
                 await websocket.send_json(
                     _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="media-received")
                 )
+                if session.is_playback_gate_active():
+                    _log_streaming(
+                        f"event=stt_skipped stream_sid={session.stream_sid} "
+                        f"call_sid={session.call_sid} reason=playback_gate"
+                    )
+                    continue
+
+                session.append_audio_bytes(raw_audio)
+                if len(session.audio_buffer) < TRANSCRIBE_BUFFER_BYTES:
+                    _log_streaming(
+                        f"event=stt_skipped stream_sid={session.stream_sid} call_sid={session.call_sid} "
+                        f"reason=insufficient_audio buffered_bytes={len(session.audio_buffer)}"
+                    )
+                    continue
+
+                audio_chunk = session.consume_audio_chunk(TRANSCRIBE_BUFFER_BYTES)
+                if not audio_chunk:
+                    _log_streaming(
+                        f"event=stt_skipped stream_sid={session.stream_sid} call_sid={session.call_sid} "
+                        f"reason=insufficient_audio buffered_bytes={len(session.audio_buffer)}"
+                    )
+                    continue
+                if stt_adapter.is_low_energy_pcm16(audio_chunk):
+                    _log_streaming(
+                        f"event=stt_skipped stream_sid={session.stream_sid} call_sid={session.call_sid} "
+                        f"reason=low_energy buffered_bytes={len(audio_chunk)}"
+                    )
+                    continue
+
+                _log_streaming(
+                    f"event=stt_invoked stream_sid={session.stream_sid} call_sid={session.call_sid} "
+                    f"buffered_bytes={len(audio_chunk)}"
+                )
+                transcript_text = None
+                try:
+                    transcript_text = stt_adapter.transcribe_buffer(session, audio_chunk)
+                except Exception as exc:
+                    _log_streaming(
+                        f"event=stt_error stream_sid={session.stream_sid} "
+                        f"call_sid={session.call_sid} error={exc}"
+                    )
+                    transcript_text = None
+                if transcript_text:
+                    _log_streaming(
+                        f"event=transcript stream_sid={session.stream_sid} "
+                        f"call_sid={session.call_sid} transcript={transcript_text!r}"
+                    )
+                else:
+                    _log_streaming(
+                        f"event=transcript stream_sid={session.stream_sid} "
+                        f"call_sid={session.call_sid} transcript=None"
+                    )
+                reply_plan = maybe_transcript_to_reply(session, transcript_text)
                 if reply_plan.reply_text:
                     _log_streaming(
                         f"event=reply stream_sid={session.stream_sid} call_sid={session.call_sid} "
@@ -175,6 +206,7 @@ async def media_stream(websocket: WebSocket):
                         )
                         audio_bytes = None
                     if audio_bytes:
+                        session.activate_playback_gate(PLAYBACK_GATE_SECONDS)
                         await websocket.send_json(_build_outbound_media_message(stream_sid=session.stream_sid, audio_bytes=audio_bytes))
                         _log_streaming(
                             f"event=outbound_audio stream_sid={session.stream_sid} "

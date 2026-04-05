@@ -249,6 +249,8 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - current implementation decodes inbound Twilio mu-law frames, converts them to PCM, upsamples from 8kHz to 16kHz, buffers short chunks for STT, and passes any transcript text into the existing assistant logic on a deterministic fallback path
 - transcript generation is handled by the OpenAI transcription API through `backend/app/streaming/stt_adapter.py`, using `STREAMING_STT_MODEL` and the existing `OPENAI_API_KEY`
 - audio is decoded from Twilio base64 mu-law, converted to mono PCM16, resampled from 8kHz to 16kHz, wrapped as a mono 16-bit 16kHz WAV, and only sent to STT once about 1 second of PCM audio is buffered (`32000` bytes)
+- the streaming path now waits for about 1.5 seconds of PCM audio (`48000` bytes) before STT and skips obviously low-energy chunks
+- inbound media is temporarily gated from STT while outbound TTS audio is being played, to reduce self-transcription and repeated fallback replies
 - if transcription fails, the chunk is discarded, the error is logged, and the WebSocket session stays alive
 - reply text is now sent through `backend/app/streaming/tts_adapter.py`, synthesized to PCM, converted to Twilio-compatible mu-law 8k audio, and returned over the bidirectional stream as outbound `media` messages
 - if TTS fails, the error is logged and the WebSocket session stays alive

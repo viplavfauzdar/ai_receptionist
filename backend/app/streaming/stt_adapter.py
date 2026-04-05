@@ -71,6 +71,26 @@ def build_wav_file_bytes(pcm_audio_16khz: bytes) -> bytes:
     return wav_buffer.getvalue()
 
 
+def pcm16le_average_energy(audio_bytes: bytes) -> float:
+    if len(audio_bytes) < 2:
+        return 0.0
+    total = 0
+    count = 0
+    for index in range(0, len(audio_bytes) - 1, 2):
+        sample = int.from_bytes(audio_bytes[index : index + 2], byteorder="little", signed=True)
+        total += abs(sample)
+        count += 1
+    if count == 0:
+        return 0.0
+    return total / count
+
+
+def is_low_energy_pcm16(audio_bytes: bytes, threshold: float = 250.0) -> bool:
+    if not audio_bytes:
+        return True
+    return pcm16le_average_energy(audio_bytes) < threshold
+
+
 class OpenAIStreamingSTTProvider:
     def __init__(self, client: OpenAI | None = None) -> None:
         self._client = client
@@ -114,6 +134,9 @@ class StreamingSTTAdapter:
         mulaw_audio = decode_twilio_mulaw_payload(payload_b64)
         pcm16_8khz = mulaw_bytes_to_pcm16le(mulaw_audio)
         return resample_pcm16le_8khz_to_16khz(pcm16_8khz)
+
+    def is_low_energy_pcm16(self, pcm_audio_16khz: bytes) -> bool:
+        return is_low_energy_pcm16(pcm_audio_16khz)
 
     def transcribe_pcm16(self, session: StreamingSession, pcm_audio_16khz: bytes) -> str | None:
         if not pcm_audio_16khz:

@@ -56,6 +56,17 @@ def test_streaming_session_audio_buffering_consumes_threshold_chunks():
     assert session.total_audio_bytes == 80
 
 
+def test_streaming_session_playback_gate_blocks_and_expires():
+    session = session_module.StreamingSession(stream_sid="MZ-gate")
+
+    session.activate_playback_gate(0.1)
+    assert session.is_playback_gate_active() is True
+    assert bytes(session.audio_buffer) == b""
+
+    session.playback_gate_until = session.created_at
+    assert session.is_playback_gate_active() is False
+
+
 def test_openai_streaming_stt_provider_calls_transcriptions_api(monkeypatch):
     captured: dict[str, object] = {}
 
@@ -100,6 +111,11 @@ def test_streaming_stt_adapter_decode_pipeline_produces_non_empty_pcm():
 
     assert pcm_audio
     assert len(pcm_audio) >= 640
+
+
+def test_streaming_stt_low_energy_guard_detects_silence():
+    assert stt_module.is_low_energy_pcm16(b"\x00\x00" * 1000) is True
+    assert stt_module.is_low_energy_pcm16(b"\x00\x10" * 1000) is False
 
 
 def test_streaming_voice_bridge_uses_existing_conversational_logic(monkeypatch):
