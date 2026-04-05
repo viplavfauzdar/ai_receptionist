@@ -7,11 +7,11 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import Response
 from twilio.twiml.voice_response import Connect, Parameter, Stream, VoiceResponse
 
-from .config import settings
-from .streaming_session import StreamingSessionStore
-from .streaming_voice import maybe_transcript_to_reply
+from ..config import settings
+from .session import StreamingSessionStore
 from .stt_adapter import StreamingSTTAdapter
 from .tts_adapter import StreamingTTSAdapter
+from .voice import maybe_transcript_to_reply
 
 streaming_router = APIRouter()
 streaming_session_store = StreamingSessionStore()

@@ -83,15 +83,15 @@ Key modules:
   Skill-style markdown prompt template for the receptionist system message.
 - `backend/app/calendar_service.py`
   Google Calendar OAuth helper, appointment datetime builder, and event insertion.
-- `backend/app/streaming_routes.py`
+- `backend/app/streaming/routes.py`
   Experimental `POST /voice-stream` route and `/ws/media-stream` WebSocket endpoint.
-- `backend/app/streaming_session.py`
+- `backend/app/streaming/session.py`
   In-memory per-stream session state for Twilio Media Streams.
-- `backend/app/streaming_voice.py`
+- `backend/app/streaming/voice.py`
   Placeholder bridge where future streaming transcripts can feed assistant reply generation.
-- `backend/app/stt_adapter.py`
+- `backend/app/streaming/stt_adapter.py`
   Placeholder streaming STT boundary.
-- `backend/app/tts_adapter.py`
+- `backend/app/streaming/tts_adapter.py`
   Placeholder streaming TTS boundary.
 - `backend/app/models.py`
   SQLAlchemy ORM models.

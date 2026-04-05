@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .streaming_session import StreamingSession
+from .session import StreamingSession
 
 
 @dataclass

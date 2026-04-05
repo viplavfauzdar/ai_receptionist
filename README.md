@@ -248,6 +248,13 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - current implementation only receives and buffers media frames, tracks per-stream state, and provides placeholder STT/LLM/TTS boundaries
 - the current `/voice` path remains the primary path and is unchanged
 
+Implementation lives under:
+- `backend/app/streaming/routes.py`
+- `backend/app/streaming/session.py`
+- `backend/app/streaming/voice.py`
+- `backend/app/streaming/stt_adapter.py`
+- `backend/app/streaming/tts_adapter.py`
+
 To test the experimental path locally:
 
 1. Set in `backend/.env`:

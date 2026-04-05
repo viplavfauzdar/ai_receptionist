@@ -27,7 +27,7 @@ from .config import settings
 from .db import Base, ensure_sqlite_compatibility, engine, get_db
 from .models import AppointmentRequest, Business, CallLog, CallSession
 from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut, GoogleCalendarSelection
-from .streaming_routes import streaming_router
+from .streaming import streaming_router
 
 Base.metadata.create_all(bind=engine)
 ensure_sqlite_compatibility()

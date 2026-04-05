@@ -3,7 +3,7 @@ import json
 import xml.etree.ElementTree as ET
 
 
-streaming_module = importlib.import_module("app.streaming_routes")
+streaming_module = importlib.import_module("app.streaming.routes")
 
 
 def _parse_xml(text: str) -> ET.Element:

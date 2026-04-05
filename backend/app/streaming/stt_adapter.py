@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .streaming_session import StreamingSession
+from .session import StreamingSession
 
 
 class StreamingSTTAdapter:
