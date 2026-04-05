@@ -126,8 +126,9 @@ def test_media_stream_transcribes_buffered_audio_and_updates_session(client, mon
         "transcribe_buffer",
         lambda session, audio_chunk: "What are your hours?" if audio_chunk else None,
     )
+    monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 640)
 
-    payload = b64encode(b"\xff" * 80).decode("ascii")
+    payload = b64encode(b"\xff" * 160).decode("ascii")
 
     with client.websocket_connect("/ws/media-stream") as websocket:
         websocket.send_text(
@@ -161,3 +162,102 @@ def test_media_stream_transcribes_buffered_audio_and_updates_session(client, mon
         assert session.last_reply_text is not None
         assert session.last_reply_text.startswith("Our hours are ")
         assert session.current_intent == "BUSINESS_HOURS"
+
+
+def test_media_stream_does_not_call_stt_for_tiny_audio_chunks(client, monkeypatch):
+    monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
+    streaming_module.streaming_session_store._sessions.clear()
+    monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 32000)
+    call_count = {"count": 0}
+
+    def _fake_transcribe(session, audio_chunk):
+        call_count["count"] += 1
+        return "should not happen"
+
+    monkeypatch.setattr(streaming_module.stt_adapter, "transcribe_buffer", _fake_transcribe)
+    payload = b64encode(b"\xff" * 80).decode("ascii")
+
+    with client.websocket_connect("/ws/media-stream") as websocket:
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ-tiny",
+                        "callSid": "CA-tiny",
+                        "customParameters": {},
+                    },
+                }
+            )
+        )
+        websocket.receive_json()
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "media",
+                    "streamSid": "MZ-tiny",
+                    "media": {"payload": payload},
+                }
+            )
+        )
+        media_ack = websocket.receive_json()
+        assert media_ack["mark"]["name"] == "media-received"
+
+        session = streaming_module.streaming_session_store.get("MZ-tiny")
+        assert session is not None
+        assert session.last_transcript_text is None
+        assert call_count["count"] == 0
+
+
+def test_media_stream_survives_stt_failure_and_keeps_session_alive(client, monkeypatch):
+    monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
+    streaming_module.streaming_session_store._sessions.clear()
+    monkeypatch.setattr(streaming_module, "TRANSCRIBE_BUFFER_BYTES", 640)
+
+    def _failing_transcribe(session, audio_chunk):
+        raise RuntimeError("unsupported audio")
+
+    monkeypatch.setattr(streaming_module.stt_adapter, "transcribe_buffer", _failing_transcribe)
+    payload = b64encode(b"\xff" * 80).decode("ascii")
+
+    with client.websocket_connect("/ws/media-stream") as websocket:
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ-stt-error",
+                        "callSid": "CA-stt-error",
+                        "customParameters": {},
+                    },
+                }
+            )
+        )
+        websocket.receive_json()
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "media",
+                    "streamSid": "MZ-stt-error",
+                    "media": {"payload": payload},
+                }
+            )
+        )
+        media_ack = websocket.receive_json()
+        assert media_ack["mark"]["name"] == "media-received"
+
+        session = streaming_module.streaming_session_store.get("MZ-stt-error")
+        assert session is not None
+        assert session.last_transcript_text is None
+
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "mark",
+                    "streamSid": "MZ-stt-error",
+                    "mark": {"name": "after-error"},
+                }
+            )
+        )
+        mark_ack = websocket.receive_json()
+        assert mark_ack["mark"]["name"] == "mark-received"

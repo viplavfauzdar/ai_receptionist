@@ -247,6 +247,8 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - TwiML uses `<Connect><Stream>` so Twilio opens one bidirectional WebSocket per call
 - current implementation decodes inbound Twilio mu-law frames, converts them to PCM, upsamples from 8kHz to 16kHz, buffers short chunks for STT, and passes any transcript text into the existing assistant logic on a deterministic fallback path
 - transcript generation is handled by the OpenAI transcription API through `backend/app/streaming/stt_adapter.py`, using `STREAMING_STT_MODEL` and the existing `OPENAI_API_KEY`
+- audio is decoded from Twilio base64 mu-law, converted to mono PCM16, resampled from 8kHz to 16kHz, wrapped as a mono 16-bit 16kHz WAV, and only sent to STT once about 1 second of PCM audio is buffered (`32000` bytes)
+- if transcription fails, the chunk is discarded, the error is logged, and the WebSocket session stays alive
 - outbound TTS is still a placeholder, so this path does not yet speak generated replies back to the caller
 - the current `/voice` path remains the primary path and is unchanged
 

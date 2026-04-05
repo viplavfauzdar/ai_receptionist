@@ -17,7 +17,7 @@ streaming_router = APIRouter()
 streaming_session_store = StreamingSessionStore()
 stt_adapter = StreamingSTTAdapter()
 tts_adapter = StreamingTTSAdapter()
-TRANSCRIBE_BUFFER_BYTES = 320
+TRANSCRIBE_BUFFER_BYTES = 32000
 
 
 def _log_streaming(message: str) -> None:
@@ -123,7 +123,14 @@ async def media_stream(websocket: WebSocket):
                 transcript_text = None
                 audio_chunk = session.consume_audio_chunk(TRANSCRIBE_BUFFER_BYTES)
                 if audio_chunk:
-                    transcript_text = stt_adapter.transcribe_buffer(session, audio_chunk)
+                    try:
+                        transcript_text = stt_adapter.transcribe_buffer(session, audio_chunk)
+                    except Exception as exc:
+                        _log_streaming(
+                            f"event=stt_error stream_sid={session.stream_sid} "
+                            f"call_sid={session.call_sid} error={exc}"
+                        )
+                        transcript_text = None
                     if transcript_text:
                         _log_streaming(
                             f"event=transcript stream_sid={session.stream_sid} "

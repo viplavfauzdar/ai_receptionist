@@ -109,6 +109,9 @@ The streaming path is intentionally isolated from the main receptionist flow.
 - `POST /voice-stream` returns TwiML with `<Connect><Stream>`
 - `/ws/media-stream` accepts Twilio Media Streams WebSocket messages
 - inbound `media` frames are decoded from base64 mu-law, converted to 16-bit PCM, upsampled to 16kHz, buffered, and passed through a narrow STT boundary
+- the streaming STT adapter wraps buffered audio as a mono 16-bit 16kHz WAV before calling the OpenAI transcription API
+- the route waits for roughly 1 second of PCM audio (`32000` bytes) before attempting transcription, to avoid tiny invalid audio uploads
+- transcription exceptions are handled inside the streaming route so a bad chunk does not terminate the WebSocket session
 - the current STT provider for that boundary is the OpenAI transcription API, configured by `OPENAI_API_KEY` plus `STREAMING_STT_MODEL`
 - when transcript text is produced, the streaming bridge passes it into the existing receptionist logic on a deterministic fallback path
 - outbound TTS is still a placeholder, so replies are generated logically but not yet spoken back over the stream

@@ -23,23 +23,19 @@ def decode_twilio_mulaw_payload(payload_b64: str) -> bytes:
     except (BinasciiError, ValueError):
         return b""
 
-
-def _mulaw_byte_to_pcm16_sample(value: int) -> int:
-    ulaw = (~value) & 0xFF
-    sign = ulaw & 0x80
-    exponent = (ulaw >> 4) & 0x07
-    mantissa = ulaw & 0x0F
-    sample = ((mantissa << 3) + _MU_LAW_BIAS) << exponent
-    sample -= _MU_LAW_BIAS
-    return -sample if sign else sample
-
-
 def mulaw_bytes_to_pcm16le(audio_bytes: bytes) -> bytes:
     if not audio_bytes:
         return b""
     pcm = bytearray()
     for byte in audio_bytes:
-        sample = _mulaw_byte_to_pcm16_sample(byte)
+        ulaw = (~byte) & 0xFF
+        sign = ulaw & 0x80
+        exponent = (ulaw >> 4) & 0x07
+        mantissa = ulaw & 0x0F
+        sample = ((mantissa << 3) + _MU_LAW_BIAS) << exponent
+        sample -= _MU_LAW_BIAS
+        if sign:
+            sample = -sample
         pcm.extend(int(sample).to_bytes(2, byteorder="little", signed=True))
     return bytes(pcm)
 
@@ -60,6 +56,10 @@ def resample_pcm16le_8khz_to_16khz(audio_bytes: bytes) -> bytes:
 
 
 def build_wav_file_bytes(pcm_audio_16khz: bytes) -> bytes:
+    if not pcm_audio_16khz:
+        return b""
+    if len(pcm_audio_16khz) % 2 != 0:
+        pcm_audio_16khz = pcm_audio_16khz[:-1]
     if not pcm_audio_16khz:
         return b""
     wav_buffer = BytesIO()

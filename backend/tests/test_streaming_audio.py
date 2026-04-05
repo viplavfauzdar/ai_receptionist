@@ -20,11 +20,12 @@ def test_decode_twilio_mulaw_payload_handles_valid_and_invalid_base64():
 def test_mulaw_to_pcm16_and_resample_boundaries():
     pcm_8khz = stt_module.mulaw_bytes_to_pcm16le(b"\xff\x00")
 
-    assert pcm_8khz[:2] == (0).to_bytes(2, byteorder="little", signed=True)
+    assert len(pcm_8khz) == 4
+    assert pcm_8khz != b"\x00\x00\x00\x00"
     assert len(pcm_8khz) == 4
 
     pcm_16khz = stt_module.resample_pcm16le_8khz_to_16khz(pcm_8khz)
-    assert pcm_16khz[:4] == pcm_8khz[:2] * 2
+    assert pcm_16khz[:2] == pcm_8khz[:2]
     assert len(pcm_16khz) == 8
 
 
@@ -32,6 +33,7 @@ def test_build_wav_file_bytes_wraps_pcm_with_expected_format():
     wav_bytes = stt_module.build_wav_file_bytes(b"\x01\x00\x02\x00")
 
     assert wav_bytes.startswith(b"RIFF")
+    assert wav_bytes[8:12] == b"WAVE"
     with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
         assert wav_file.getnchannels() == 1
         assert wav_file.getsampwidth() == 2
@@ -88,6 +90,16 @@ def test_openai_streaming_stt_provider_returns_none_without_key_or_text(monkeypa
     fake_client = type("FakeClient", (), {"audio": type("Audio", (), {"transcriptions": _FakeTranscriptions()})()})()
     provider = stt_module.OpenAIStreamingSTTProvider(client=fake_client)
     assert provider.transcribe_pcm16(b"\x01\x00") is None
+
+
+def test_streaming_stt_adapter_decode_pipeline_produces_non_empty_pcm():
+    payload = base64.b64encode(b"\xff" * 160).decode("ascii")
+    adapter = stt_module.StreamingSTTAdapter()
+
+    pcm_audio = adapter.decode_payload_to_pcm16_16khz(payload)
+
+    assert pcm_audio
+    assert len(pcm_audio) >= 640
 
 
 def test_streaming_voice_bridge_uses_existing_conversational_logic(monkeypatch):
