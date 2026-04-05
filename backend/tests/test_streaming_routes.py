@@ -1,6 +1,7 @@
 import importlib
 import json
 import xml.etree.ElementTree as ET
+from base64 import b64encode
 
 
 streaming_module = importlib.import_module("app.streaming.routes")
@@ -115,3 +116,48 @@ def test_media_stream_disconnect_cleans_up_session(client, monkeypatch):
         assert streaming_module.streaming_session_store.get("MZ-cleanup") is not None
 
     assert streaming_module.streaming_session_store.get("MZ-cleanup") is None
+
+
+def test_media_stream_transcribes_buffered_audio_and_updates_session(client, monkeypatch):
+    monkeypatch.setattr(streaming_module.settings, "enable_streaming_voice_experiment", True)
+    streaming_module.streaming_session_store._sessions.clear()
+    monkeypatch.setattr(
+        streaming_module.stt_adapter,
+        "transcribe_buffer",
+        lambda session, audio_chunk: "What are your hours?" if audio_chunk else None,
+    )
+
+    payload = b64encode(b"\xff" * 80).decode("ascii")
+
+    with client.websocket_connect("/ws/media-stream") as websocket:
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ-transcribe",
+                        "callSid": "CA-transcribe",
+                        "customParameters": {},
+                    },
+                }
+            )
+        )
+        websocket.receive_json()
+        websocket.send_text(
+            json.dumps(
+                {
+                    "event": "media",
+                    "streamSid": "MZ-transcribe",
+                    "media": {"payload": payload},
+                }
+            )
+        )
+        media_ack = websocket.receive_json()
+        assert media_ack["mark"]["name"] == "media-received"
+
+        session = streaming_module.streaming_session_store.get("MZ-transcribe")
+        assert session is not None
+        assert session.last_transcript_text == "What are your hours?"
+        assert session.last_reply_text is not None
+        assert session.last_reply_text.startswith("Our hours are ")
+        assert session.current_intent == "BUSINESS_HOURS"

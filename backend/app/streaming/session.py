@@ -17,6 +17,10 @@ class StreamingSession:
     media_chunk_count: int = 0
     total_audio_bytes: int = 0
     audio_buffer: bytearray = field(default_factory=bytearray)
+    current_intent: str = "GENERAL_QUESTION"
+    current_state: str = "NEW"
+    slot_data: dict[str, str] = field(default_factory=dict)
+    transcript: list[dict[str, str]] = field(default_factory=list)
     last_transcript_text: str | None = None
     last_reply_text: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
@@ -28,15 +32,32 @@ class StreamingSession:
 
     def append_media_payload(self, payload_b64: str) -> bytes:
         decoded = base64.b64decode(payload_b64)
-        self.audio_buffer.extend(decoded)
-        self.media_chunk_count += 1
-        self.total_audio_bytes += len(decoded)
-        self.updated_at = datetime.utcnow()
+        self.record_media_chunk(len(decoded))
+        self.append_audio_bytes(decoded)
         return decoded
 
     def flush_audio_buffer(self) -> bytes:
         chunk = bytes(self.audio_buffer)
         self.audio_buffer.clear()
+        self.updated_at = datetime.utcnow()
+        return chunk
+
+    def record_media_chunk(self, raw_size_bytes: int) -> None:
+        self.media_chunk_count += 1
+        self.total_audio_bytes += raw_size_bytes
+        self.updated_at = datetime.utcnow()
+
+    def append_audio_bytes(self, audio_bytes: bytes) -> None:
+        if not audio_bytes:
+            return
+        self.audio_buffer.extend(audio_bytes)
+        self.updated_at = datetime.utcnow()
+
+    def consume_audio_chunk(self, minimum_bytes: int) -> bytes | None:
+        if minimum_bytes <= 0 or len(self.audio_buffer) < minimum_bytes:
+            return None
+        chunk = bytes(self.audio_buffer[:minimum_bytes])
+        del self.audio_buffer[:minimum_bytes]
         self.updated_at = datetime.utcnow()
         return chunk
 

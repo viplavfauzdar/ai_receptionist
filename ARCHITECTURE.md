@@ -86,11 +86,11 @@ Key modules:
 - `backend/app/streaming/routes.py`
   Experimental `POST /voice-stream` route and `/ws/media-stream` WebSocket endpoint.
 - `backend/app/streaming/session.py`
-  In-memory per-stream session state for Twilio Media Streams.
+  In-memory per-stream session state for Twilio Media Streams, including buffered audio and lightweight transcript/state data.
 - `backend/app/streaming/voice.py`
-  Placeholder bridge where future streaming transcripts can feed assistant reply generation.
+  Bridge where streaming transcripts feed the existing receptionist response logic.
 - `backend/app/streaming/stt_adapter.py`
-  Placeholder streaming STT boundary.
+  Twilio mu-law decode, PCM conversion, 8kHz-to-16kHz upsampling, and STT boundary.
 - `backend/app/streaming/tts_adapter.py`
   Placeholder streaming TTS boundary.
 - `backend/app/models.py`
@@ -108,7 +108,9 @@ The streaming path is intentionally isolated from the main receptionist flow.
 
 - `POST /voice-stream` returns TwiML with `<Connect><Stream>`
 - `/ws/media-stream` accepts Twilio Media Streams WebSocket messages
-- the current implementation only handles the transport skeleton and in-memory stream session state
+- inbound `media` frames are decoded from base64 mu-law, converted to 16-bit PCM, upsampled to 16kHz, buffered, and passed through a narrow STT boundary
+- when transcript text is produced, the streaming bridge passes it into the existing receptionist logic on a deterministic fallback path
+- outbound TTS is still a placeholder, so replies are generated logically but not yet spoken back over the stream
 - the existing `POST /voice` path remains the primary production path for booking, calendar, and current receptionist behavior
 - this streaming path is the future direction for lower-latency voice once STT, LLM, and TTS adapters are plugged in
 

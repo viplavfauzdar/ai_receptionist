@@ -245,7 +245,8 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - Twilio webhook: `POST /voice-stream`
 - WebSocket endpoint: `/ws/media-stream`
 - TwiML uses `<Connect><Stream>` so Twilio opens one bidirectional WebSocket per call
-- current implementation only receives and buffers media frames, tracks per-stream state, and provides placeholder STT/LLM/TTS boundaries
+- current implementation decodes inbound Twilio mu-law frames, converts them to PCM, upsamples from 8kHz to 16kHz, buffers short chunks for STT, and passes any transcript text into the existing assistant logic on a deterministic fallback path
+- outbound TTS is still a placeholder, so this path does not yet speak generated replies back to the caller
 - the current `/voice` path remains the primary path and is unchanged
 
 Implementation lives under:
@@ -278,7 +279,7 @@ https://YOUR-NGROK-URL/voice-stream
 wss://YOUR-NGROK-URL/ws/media-stream
 ```
 
-This path is currently transport-only. It is ready for future STT, LLM, and TTS integration, but it does not replace the main receptionist flow yet.
+This path is currently inbound-audio only. It can now decode and buffer Twilio audio and hand transcript text into the existing receptionist logic, but outbound TTS is still a placeholder and it does not replace the main receptionist flow yet.
 
 Example 3-turn booking flow:
 1. Caller: `I want to book an appointment`

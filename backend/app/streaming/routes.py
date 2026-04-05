@@ -116,10 +116,19 @@ async def media_stream(websocket: WebSocket):
                 if session is None:
                     session = streaming_session_store.create_connected_placeholder(current_stream_sid)
                 session.record_event("media")
-                session.append_media_payload(str(media.get("payload") or ""))
+                raw_payload = str(media.get("payload") or "")
+                raw_audio = stt_adapter.decode_payload_to_pcm16_16khz(raw_payload)
+                session.record_media_chunk(len(raw_audio) // 4 if raw_audio else 0)
+                session.append_audio_bytes(raw_audio)
                 transcript_text = None
-                if len(session.audio_buffer) >= TRANSCRIBE_BUFFER_BYTES:
-                    transcript_text = stt_adapter.transcribe_buffer(session, session.flush_audio_buffer())
+                audio_chunk = session.consume_audio_chunk(TRANSCRIBE_BUFFER_BYTES)
+                if audio_chunk:
+                    transcript_text = stt_adapter.transcribe_buffer(session, audio_chunk)
+                    if transcript_text:
+                        _log_streaming(
+                            f"event=transcript stream_sid={session.stream_sid} "
+                            f"call_sid={session.call_sid} transcript={transcript_text!r}"
+                        )
                 reply_plan = maybe_transcript_to_reply(session, transcript_text)
                 await websocket.send_json(
                     _build_outbound_mark_message(stream_sid=session.stream_sid, mark_name="media-received")
