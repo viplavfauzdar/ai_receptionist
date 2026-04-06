@@ -50,7 +50,13 @@ def test_system_prompt_uses_builtin_default_when_file_missing(monkeypatch: pytes
 
 
 def test_requested_time_extraction_handles_day_and_time():
-    assert ai_module._extract_requested_time("next Tuesday at 3 pm please") == "Tuesday at 3 pm please"
+    assert ai_module._extract_requested_time("next Tuesday at 3 pm please") == "Tuesday at 3 pm"
+
+
+def test_appointment_time_extraction_handles_spoken_and_short_time_phrases():
+    assert ai_module._extract_appointment_time("three pm") == "3 pm"
+    assert ai_module._extract_appointment_time("2:30", allow_bare_hour=True) == "2:30"
+    assert ai_module._extract_appointment_time("2", allow_bare_hour=True) == "2"
 
 
 def test_fallback_mode_returns_booking_response(env_overrides):

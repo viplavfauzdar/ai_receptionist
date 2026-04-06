@@ -14,6 +14,21 @@ INTENTS = {
     "GENERAL_QUESTION",
 }
 
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
 SAFE_STATES = {
     "NEW",
     "GREETING_SENT",
@@ -151,16 +166,13 @@ def format_phone_number_for_speech(phone_number: str) -> str:
 
 
 def _extract_requested_time(user_input: str) -> str | None:
-    patterns = [
-        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b(?:[^.?!,;]*)",
-        r"\b(?:today|tomorrow|next week|next monday|next tuesday|next wednesday|next thursday|next friday)\b(?:[^.?!,;]*)",
-        r"\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b(?:[^.?!,;]*)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, user_input, flags=re.IGNORECASE)
-        if match:
-            return match.group(0).strip()
-    return None
+    day = _extract_appointment_day(user_input)
+    time = _extract_appointment_time(user_input, allow_bare_hour=True)
+    if day and time:
+        return f"{day} at {time}"
+    if day:
+        return day
+    return time
 
 
 def _extract_appointment_day(user_input: str) -> str | None:
@@ -175,10 +187,46 @@ def _extract_appointment_day(user_input: str) -> str | None:
     return None
 
 
-def _extract_appointment_time(user_input: str) -> str | None:
-    match = re.search(r"\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b", user_input, flags=re.IGNORECASE)
+def _normalize_time_match(hour: str, meridiem: str | None = None, minute: str | None = None) -> str:
+    hour_clean = hour.strip().lower()
+    if hour_clean in NUMBER_WORDS:
+        hour_clean = str(NUMBER_WORDS[hour_clean])
+    meridiem_clean = (meridiem or "").strip().lower().replace(".", "")
+    minute_clean = (minute or "").strip()
+
+    if minute_clean:
+        if meridiem_clean:
+            return f"{hour_clean}:{minute_clean} {meridiem_clean}"
+        return f"{hour_clean}:{minute_clean}"
+    if meridiem_clean:
+        return f"{hour_clean} {meridiem_clean}"
+    return hour_clean
+
+
+def _extract_appointment_time(user_input: str, *, allow_bare_hour: bool = False) -> str | None:
+    match = re.search(
+        r"\b(?P<hour>\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        r"(?::(?P<minute>\d{2}))?\s?(?P<meridiem>am|pm)\b",
+        user_input,
+        flags=re.IGNORECASE,
+    )
     if match:
-        return match.group(0).strip()
+        return _normalize_time_match(
+            match.group("hour"),
+            match.group("meridiem"),
+            match.group("minute"),
+        )
+    if allow_bare_hour:
+        match = re.search(r"\b(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))\b", user_input, flags=re.IGNORECASE)
+        if match:
+            return _normalize_time_match(match.group("hour"), None, match.group("minute"))
+        match = re.search(
+            r"\b(?P<hour>\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b",
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return _normalize_time_match(match.group("hour"))
     return None
 
 
@@ -341,7 +389,10 @@ def _fallback_result(
 
     phone_number = _extract_phone_number(user_input)
     appointment_day = _extract_appointment_day(user_input)
-    appointment_time = _extract_appointment_time(user_input)
+    appointment_time = _extract_appointment_time(
+        user_input,
+        allow_bare_hour=session.current_state == "COLLECTING_APPOINTMENT_TIME",
+    )
     caller_name = _extract_caller_name(user_input)
     stripped_input = user_input.strip(" .,!?:;")
 

@@ -257,6 +257,8 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - if transcription fails, the chunk is discarded, the error is logged, and the WebSocket session stays alive
 - reply text is sent through `backend/app/streaming/tts_adapter.py`, synthesized to PCM, converted to Twilio-compatible mono 8kHz mu-law audio, base64 encoded, and returned over the bidirectional stream as outbound `media` messages
 - if TTS fails, the error is logged and the WebSocket session stays alive
+- short booking phrases in the streaming path such as `3 PM`, `Thursday`, `Thursday at 4`, and `tomorrow at 3 PM` now normalize into booking slots so the conversation advances instead of repeating the same question
+- if the streaming booking bridge would repeat the same collection question twice in a row, it switches to a more explicit reprompt such as `I didn't catch the time. You can say something like 3 PM.`
 - the current `/voice` path remains the primary path and is unchanged
 
 Implementation lives under:

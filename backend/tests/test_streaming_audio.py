@@ -187,3 +187,69 @@ def test_streaming_voice_bridge_empty_transcript_repompts_instead_of_reset():
     assert reply_plan.reply_text == "Sorry, I didn't catch that. Could you say that again?"
     assert reply_plan.fallback_used is True
     assert session.last_reply_text == "Sorry, I didn't catch that. Could you say that again?"
+
+
+def test_streaming_voice_bridge_short_time_advances_booking_state():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-time",
+        call_sid="CA-time",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_APPOINTMENT_TIME",
+        slot_data={"appointment_day": "Thursday"},
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "3 PM")
+
+    assert reply_plan.intent == "BOOK_APPOINTMENT"
+    assert session.slot_data["appointment_time"] == "3 pm"
+    assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
+    assert reply_plan.reply_text == "What callback number should we use?"
+
+
+def test_streaming_voice_bridge_short_day_advances_booking_state():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-day",
+        call_sid="CA-day",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_APPOINTMENT_DAY",
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "Thursday")
+
+    assert reply_plan.intent == "BOOK_APPOINTMENT"
+    assert session.slot_data["appointment_day"] == "Thursday"
+    assert session.current_state == "COLLECTING_APPOINTMENT_TIME"
+    assert reply_plan.reply_text == "What time works best for you?"
+
+
+def test_streaming_voice_bridge_combined_day_and_time_advances_to_callback_collection():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-combined",
+        call_sid="CA-combined",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_APPOINTMENT_DAY",
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "tomorrow at 3 PM")
+
+    assert reply_plan.intent == "BOOK_APPOINTMENT"
+    assert session.slot_data["appointment_day"] == "tomorrow"
+    assert session.slot_data["appointment_time"] == "3 pm"
+    assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
+    assert reply_plan.reply_text == "What callback number should we use?"
+
+
+def test_streaming_voice_bridge_repeated_time_prompt_uses_explicit_reprompt():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-repeat",
+        call_sid="CA-repeat",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_APPOINTMENT_TIME",
+        slot_data={"appointment_day": "Thursday"},
+        last_reply_text="What time works best for you?",
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "yes")
+
+    assert session.current_state == "COLLECTING_APPOINTMENT_TIME"
+    assert reply_plan.reply_text == "I didn't catch the time. You can say something like 3 PM."
