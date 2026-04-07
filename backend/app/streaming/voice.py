@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..ai import BusinessContext, SessionContext, detect_and_respond
+from ..ai import (
+    BusinessContext,
+    ReceptionistResult,
+    SessionContext,
+    detect_and_respond,
+    extract_phone_digits_fragment,
+    normalize_us_phone_number,
+)
 from .session import StreamingSession
 
 
@@ -45,6 +52,46 @@ def _apply_repetition_guard(session: StreamingSession, state_before: str, state_
     return _state_specific_reprompt(state_after)
 
 
+def _handle_streaming_callback_digits(
+    session: StreamingSession,
+    transcript_text: str,
+) -> ReceptionistResult | None:
+    if session.current_state != "COLLECTING_CALLBACK_NUMBER":
+        return None
+    extracted_digits = extract_phone_digits_fragment(transcript_text)
+    if not extracted_digits:
+        return None
+
+    digit_buffer = f"{session.digit_buffer}{extracted_digits}"
+    normalized_number = normalize_us_phone_number(digit_buffer)
+    if normalized_number:
+        return detect_and_respond(
+            normalized_number,
+            business=BusinessContext(),
+            session=SessionContext(
+                call_sid=session.call_sid,
+                current_intent=session.current_intent,
+                current_state=session.current_state,
+                slot_data=dict(session.slot_data),
+                transcript=list(session.transcript),
+            ),
+            force_fallback_reason="streaming_experimental_path",
+        )
+
+    session.digit_buffer = digit_buffer[:11]
+    _log_streaming_voice(
+        f"transcript={transcript_text!r} state_before={session.current_state} "
+        f"extracted_digits={extracted_digits!r} digit_buffer={session.digit_buffer!r} "
+        f"state_after={session.current_state}"
+    )
+    return ReceptionistResult(
+        intent=session.current_intent or "BOOK_APPOINTMENT",
+        state="COLLECTING_CALLBACK_NUMBER",
+        response="What callback number should we use?",
+        fields={},
+    )
+
+
 def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | None) -> StreamingReplyPlan:
     normalized_transcript = " ".join((transcript_text or "").split()).strip()
     session.last_transcript_text = normalized_transcript or None
@@ -64,18 +111,20 @@ def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | 
         )
 
     session.transcript.append({"role": "caller", "text": normalized_transcript})
-    result = detect_and_respond(
-        normalized_transcript,
-        business=BusinessContext(),
-        session=SessionContext(
-            call_sid=session.call_sid,
-            current_intent=session.current_intent,
-            current_state=session.current_state,
-            slot_data=dict(session.slot_data),
-            transcript=list(session.transcript),
-        ),
-        force_fallback_reason="streaming_experimental_path",
-    )
+    result = _handle_streaming_callback_digits(session, normalized_transcript)
+    if result is None:
+        result = detect_and_respond(
+            normalized_transcript,
+            business=BusinessContext(),
+            session=SessionContext(
+                call_sid=session.call_sid,
+                current_intent=session.current_intent,
+                current_state=session.current_state,
+                slot_data=dict(session.slot_data),
+                transcript=list(session.transcript),
+            ),
+            force_fallback_reason="streaming_experimental_path",
+        )
     state_after = result.state
     slot_data_after_merge = dict(session.slot_data)
     slot_data_after_merge.update(result.fields)
@@ -83,11 +132,14 @@ def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | 
     session.current_intent = result.intent
     session.current_state = state_after
     session.slot_data.update(result.fields)
+    if result.fields.get("callback_number") or state_after != "COLLECTING_CALLBACK_NUMBER":
+        session.digit_buffer = ""
     session.transcript.append({"role": "assistant", "text": reply_text})
     session.last_reply_text = reply_text
     _log_streaming_voice(
         f"transcript={normalized_transcript!r} state_before={state_before} "
-        f"extracted_fields={result.fields} slot_data_after_merge={slot_data_after_merge} "
+        f"extracted_fields={result.fields} digit_buffer={session.digit_buffer!r} "
+        f"slot_data_after_merge={slot_data_after_merge} "
         f"state_after={state_after} reply={reply_text!r}"
     )
     return StreamingReplyPlan(

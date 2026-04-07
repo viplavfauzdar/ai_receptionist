@@ -320,3 +320,47 @@ def test_streaming_voice_bridge_repeated_callback_prompt_uses_explicit_reprompt(
 
     assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
     assert reply_plan.reply_text == "I didn't catch the number. You can say it digit by digit, like 678 462 4453."
+
+
+def test_streaming_voice_bridge_accumulates_fragmented_callback_digits():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-callback-fragments",
+        call_sid="CA-callback-fragments",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_CALLBACK_NUMBER",
+        slot_data={"appointment_day": "Thursday", "appointment_time": "3 pm"},
+    )
+
+    first_reply = voice_module.maybe_transcript_to_reply(session, "six seven eight")
+    assert session.digit_buffer == "678"
+    assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
+    assert first_reply.reply_text == "What callback number should we use?"
+
+    second_reply = voice_module.maybe_transcript_to_reply(session, "four six two")
+    assert session.digit_buffer == "678462"
+    assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
+    assert second_reply.reply_text == "I didn't catch the number. You can say it digit by digit, like 678 462 4453."
+
+    third_reply = voice_module.maybe_transcript_to_reply(session, "four four five three")
+    assert session.digit_buffer == ""
+    assert session.slot_data["callback_number"] == "6784624453"
+    assert session.current_state == "COLLECTING_CALLER_NAME"
+    assert third_reply.reply_text == "What name should I put on that request?"
+
+
+def test_streaming_voice_bridge_accumulates_fragmented_numeric_callback_digits():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-callback-numeric-fragments",
+        call_sid="CA-callback-numeric-fragments",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_CALLBACK_NUMBER",
+        slot_data={"appointment_day": "Thursday", "appointment_time": "3 pm"},
+    )
+
+    voice_module.maybe_transcript_to_reply(session, "678 462")
+    assert session.digit_buffer == "678462"
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "4453")
+    assert session.slot_data["callback_number"] == "6784624453"
+    assert session.current_state == "COLLECTING_CALLER_NAME"
+    assert reply_plan.reply_text == "What name should I put on that request?"

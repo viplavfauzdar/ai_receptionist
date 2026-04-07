@@ -120,6 +120,7 @@ The streaming path is intentionally isolated from the main receptionist flow.
 - when transcript text is produced, the streaming bridge passes it into the existing receptionist logic on a deterministic fallback path
 - the streaming bridge now adds booking-oriented normalization for short phone phrases such as `3 PM`, `three pm`, `2`, `2:30`, `Thursday`, and `tomorrow at 3 PM`, so slot collection can advance even from terse STT output
 - the same bridge now normalizes callback-number phrases from phone-style transcripts, including contiguous digits, spaced digits, dashed digits, and spoken digit words, into a deterministic US phone number string before state progression
+- while the streaming state is `COLLECTING_CALLBACK_NUMBER`, callback digits can now accumulate across multiple transcripts in a small in-memory digit buffer until a valid 10-digit US number or 11-digit number starting with `1` is reached
 - if the same booking collection state would emit the same question twice in a row, the streaming bridge swaps in a state-specific reprompt like `I didn't catch the time. You can say something like 3 PM.`
 - for callback-number collection, the explicit reprompt is `I didn't catch the number. You can say it digit by digit, like 678 462 4453.`
 - reply text then flows through the streaming TTS adapter, which synthesizes audio and converts it to Twilio-compatible mu-law payloads for outbound `media` messages

@@ -20,6 +20,7 @@ class StreamingSession:
     current_intent: str = "GENERAL_QUESTION"
     current_state: str = "NEW"
     slot_data: dict[str, str] = field(default_factory=dict)
+    digit_buffer: str = ""
     transcript: list[dict[str, str]] = field(default_factory=list)
     last_transcript_text: str | None = None
     last_reply_text: str | None = None

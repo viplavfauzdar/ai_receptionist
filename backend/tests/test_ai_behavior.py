@@ -4,6 +4,7 @@ from app.ai import (
     BusinessContext,
     SessionContext,
     detect_and_respond,
+    extract_phone_digits_fragment,
     format_phone_number_for_speech,
     normalize_us_phone_number,
 )
@@ -31,6 +32,11 @@ def test_phone_number_extraction_supports_spaced_and_spoken_digits():
     assert ai_module._extract_phone_number("my number is 678-462-4453") == "6784624453"
     assert ai_module._extract_phone_number("6 7 8 4 6 2 4 4 5 3") == "6784624453"
     assert ai_module._extract_phone_number("six seven eight four six two four four five three") == "6784624453"
+
+
+def test_extract_phone_digits_fragment_supports_spoken_and_split_digits():
+    assert extract_phone_digits_fragment("six seven eight") == "678"
+    assert extract_phone_digits_fragment("4 6 2") == "462"
 
 
 def test_openai_client_helper_returns_none_without_key(env_overrides):

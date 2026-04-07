@@ -139,10 +139,10 @@ def normalize_us_phone_number(phone_number: str) -> str | None:
     return None
 
 
-def _extract_phone_number(user_input: str) -> str | None:
-    match = re.search(r"(\+?\d[\d\-\(\) ]{7,}\d)", user_input)
-    if match:
-        return normalize_us_phone_number(match.group(1))
+def extract_phone_digits_fragment(user_input: str) -> str:
+    numeric_digits = "".join(char for char in user_input if char.isdigit())
+    if numeric_digits:
+        return numeric_digits
 
     token_pattern = re.compile(
         r"\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine|\d)\b",
@@ -152,8 +152,17 @@ def _extract_phone_number(user_input: str) -> str | None:
         str(NUMBER_WORDS[token.lower()]) if token.lower() in NUMBER_WORDS else token
         for token in token_pattern.findall(user_input)
     ]
-    if digit_tokens:
-        return normalize_us_phone_number("".join(digit_tokens))
+    return "".join(digit_tokens)
+
+
+def _extract_phone_number(user_input: str) -> str | None:
+    match = re.search(r"(\+?\d[\d\-\(\) ]{7,}\d)", user_input)
+    if match:
+        return normalize_us_phone_number(match.group(1))
+
+    digit_fragment = extract_phone_digits_fragment(user_input)
+    if digit_fragment:
+        return normalize_us_phone_number(digit_fragment)
     return None
 
 
