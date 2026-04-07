@@ -24,7 +24,7 @@ def _state_specific_reprompt(state: str) -> str:
     if state == "COLLECTING_APPOINTMENT_TIME":
         return "I didn't catch the time. You can say something like 3 PM."
     if state == "COLLECTING_CALLBACK_NUMBER":
-        return "I didn't catch the callback number. Please say the digits slowly."
+        return "I didn't catch the number. You can say it digit by digit, like 678 462 4453."
     if state == "COLLECTING_CALLER_NAME":
         return "I didn't catch the name. Please say your first and last name."
     return "Sorry, I didn't catch that. Could you say that again?"
@@ -77,6 +77,8 @@ def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | 
         force_fallback_reason="streaming_experimental_path",
     )
     state_after = result.state
+    slot_data_after_merge = dict(session.slot_data)
+    slot_data_after_merge.update(result.fields)
     reply_text = _apply_repetition_guard(session, state_before, state_after, result.response)
     session.current_intent = result.intent
     session.current_state = state_after
@@ -85,7 +87,8 @@ def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | 
     session.last_reply_text = reply_text
     _log_streaming_voice(
         f"transcript={normalized_transcript!r} state_before={state_before} "
-        f"extracted_fields={result.fields} state_after={state_after} reply={reply_text!r}"
+        f"extracted_fields={result.fields} slot_data_after_merge={slot_data_after_merge} "
+        f"state_after={state_after} reply={reply_text!r}"
     )
     return StreamingReplyPlan(
         transcript_text=normalized_transcript,

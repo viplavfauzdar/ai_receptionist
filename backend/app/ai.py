@@ -15,6 +15,9 @@ INTENTS = {
 }
 
 NUMBER_WORDS = {
+    "zero": 0,
+    "oh": 0,
+    "o": 0,
     "one": 1,
     "two": 2,
     "three": 3,
@@ -127,9 +130,31 @@ def _get_client() -> OpenAI | None:
     return OpenAI(api_key=settings.openai_api_key)
 
 
+def normalize_us_phone_number(phone_number: str) -> str | None:
+    digits = "".join(char for char in phone_number if char.isdigit())
+    if len(digits) == 10:
+        return digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return digits
+    return None
+
+
 def _extract_phone_number(user_input: str) -> str | None:
     match = re.search(r"(\+?\d[\d\-\(\) ]{7,}\d)", user_input)
-    return match.group(1).strip() if match else None
+    if match:
+        return normalize_us_phone_number(match.group(1))
+
+    token_pattern = re.compile(
+        r"\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine|\d)\b",
+        flags=re.IGNORECASE,
+    )
+    digit_tokens = [
+        str(NUMBER_WORDS[token.lower()]) if token.lower() in NUMBER_WORDS else token
+        for token in token_pattern.findall(user_input)
+    ]
+    if digit_tokens:
+        return normalize_us_phone_number("".join(digit_tokens))
+    return None
 
 
 def _extract_caller_name(user_input: str) -> str | None:

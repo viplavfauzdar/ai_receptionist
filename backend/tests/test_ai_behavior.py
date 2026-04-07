@@ -5,6 +5,7 @@ from app.ai import (
     SessionContext,
     detect_and_respond,
     format_phone_number_for_speech,
+    normalize_us_phone_number,
 )
 
 
@@ -18,6 +19,18 @@ def test_format_phone_number_for_speech_keeps_plus_prefix():
 
 def test_format_phone_number_for_speech_handles_non_digit_string():
     assert format_phone_number_for_speech(" ext ") == "ext"
+
+
+def test_normalize_us_phone_number_accepts_10_and_11_digit_numbers():
+    assert normalize_us_phone_number("6784624453") == "6784624453"
+    assert normalize_us_phone_number("+16784624453") == "16784624453"
+
+
+def test_phone_number_extraction_supports_spaced_and_spoken_digits():
+    assert ai_module._extract_phone_number("678 462 4453") == "6784624453"
+    assert ai_module._extract_phone_number("my number is 678-462-4453") == "6784624453"
+    assert ai_module._extract_phone_number("6 7 8 4 6 2 4 4 5 3") == "6784624453"
+    assert ai_module._extract_phone_number("six seven eight four six two four four five three") == "6784624453"
 
 
 def test_openai_client_helper_returns_none_without_key(env_overrides):

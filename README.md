@@ -259,6 +259,8 @@ This is an isolated parallel path for future lower-latency voice using Twilio bi
 - if TTS fails, the error is logged and the WebSocket session stays alive
 - short booking phrases in the streaming path such as `3 PM`, `Thursday`, `Thursday at 4`, and `tomorrow at 3 PM` now normalize into booking slots so the conversation advances instead of repeating the same question
 - if the streaming booking bridge would repeat the same collection question twice in a row, it switches to a more explicit reprompt such as `I didn't catch the time. You can say something like 3 PM.`
+- callback number collection in the streaming path now normalizes phone-audio variants such as `678 462 4453`, `678-462-4453`, `6 7 8 4 6 2 4 4 5 3`, and `six seven eight four six two four four five three` into a deterministic digit string so the booking flow advances once a valid number is captured
+- if callback number collection would repeat the same question twice in a row, the streaming bridge now uses `I didn't catch the number. You can say it digit by digit, like 678 462 4453.`
 - the current `/voice` path remains the primary path and is unchanged
 
 Implementation lives under:

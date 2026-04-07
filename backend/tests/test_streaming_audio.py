@@ -253,3 +253,70 @@ def test_streaming_voice_bridge_repeated_time_prompt_uses_explicit_reprompt():
 
     assert session.current_state == "COLLECTING_APPOINTMENT_TIME"
     assert reply_plan.reply_text == "I didn't catch the time. You can say something like 3 PM."
+
+
+def test_streaming_voice_bridge_callback_number_digits_advance_state():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-callback-digits",
+        call_sid="CA-callback-digits",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_CALLBACK_NUMBER",
+        slot_data={"appointment_day": "Thursday", "appointment_time": "3 pm"},
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "6784624453")
+
+    assert session.slot_data["callback_number"] == "6784624453"
+    assert session.current_state == "COLLECTING_CALLER_NAME"
+    assert reply_plan.reply_text == "What name should I put on that request?"
+
+
+def test_streaming_voice_bridge_callback_number_spaced_digits_advance_state():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-callback-spaced",
+        call_sid="CA-callback-spaced",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_CALLBACK_NUMBER",
+        slot_data={"appointment_day": "Thursday", "appointment_time": "3 pm"},
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "678 462 4453")
+
+    assert session.slot_data["callback_number"] == "6784624453"
+    assert session.current_state == "COLLECTING_CALLER_NAME"
+    assert reply_plan.reply_text == "What name should I put on that request?"
+
+
+def test_streaming_voice_bridge_callback_number_spoken_digits_advance_state():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-callback-spoken",
+        call_sid="CA-callback-spoken",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_CALLBACK_NUMBER",
+        slot_data={"appointment_day": "Thursday", "appointment_time": "3 pm"},
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(
+        session,
+        "six seven eight four six two four four five three",
+    )
+
+    assert session.slot_data["callback_number"] == "6784624453"
+    assert session.current_state == "COLLECTING_CALLER_NAME"
+    assert reply_plan.reply_text == "What name should I put on that request?"
+
+
+def test_streaming_voice_bridge_repeated_callback_prompt_uses_explicit_reprompt():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-callback-repeat",
+        call_sid="CA-callback-repeat",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_CALLBACK_NUMBER",
+        slot_data={"appointment_day": "Thursday", "appointment_time": "3 pm"},
+        last_reply_text="What callback number should we use?",
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "yes")
+
+    assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
+    assert reply_plan.reply_text == "I didn't catch the number. You can say it digit by digit, like 678 462 4453."
