@@ -255,6 +255,21 @@ def test_streaming_voice_bridge_repeated_time_prompt_uses_explicit_reprompt():
     assert reply_plan.reply_text == "I didn't catch the time. You can say something like 3 PM."
 
 
+def test_streaming_voice_bridge_repeated_day_prompt_uses_explicit_reprompt():
+    session = session_module.StreamingSession(
+        stream_sid="MZ-repeat-day",
+        call_sid="CA-repeat-day",
+        current_intent="BOOK_APPOINTMENT",
+        current_state="COLLECTING_APPOINTMENT_DAY",
+        last_reply_text="Sure, I can help schedule that. What day works for you?",
+    )
+
+    reply_plan = voice_module.maybe_transcript_to_reply(session, "yes")
+
+    assert session.current_state == "COLLECTING_APPOINTMENT_DAY"
+    assert reply_plan.reply_text == "I didn't catch the day. You can say something like Thursday."
+
+
 def test_streaming_voice_bridge_callback_number_digits_advance_state():
     session = session_module.StreamingSession(
         stream_sid="MZ-callback-digits",
@@ -319,7 +334,7 @@ def test_streaming_voice_bridge_repeated_callback_prompt_uses_explicit_reprompt(
     reply_plan = voice_module.maybe_transcript_to_reply(session, "yes")
 
     assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
-    assert reply_plan.reply_text == "I didn't catch the number. You can say it digit by digit, like 678 462 4453."
+    assert reply_plan.reply_text == "I didn't catch the number. Please say it digit by digit, like 678 462 4453."
 
 
 def test_streaming_voice_bridge_accumulates_fragmented_callback_digits():
@@ -339,7 +354,7 @@ def test_streaming_voice_bridge_accumulates_fragmented_callback_digits():
     second_reply = voice_module.maybe_transcript_to_reply(session, "four six two")
     assert session.digit_buffer == "678462"
     assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
-    assert second_reply.reply_text == "I didn't catch the number. You can say it digit by digit, like 678 462 4453."
+    assert second_reply.reply_text == "I didn't catch the number. Please say it digit by digit, like 678 462 4453."
 
     third_reply = voice_module.maybe_transcript_to_reply(session, "four four five three")
     assert session.digit_buffer == ""

@@ -27,11 +27,11 @@ def _log_streaming_voice(message: str) -> None:
 
 def _state_specific_reprompt(state: str) -> str:
     if state == "COLLECTING_APPOINTMENT_DAY":
-        return "I didn't catch the day. You can say something like Thursday or tomorrow."
+        return "I didn't catch the day. You can say something like Thursday."
     if state == "COLLECTING_APPOINTMENT_TIME":
         return "I didn't catch the time. You can say something like 3 PM."
     if state == "COLLECTING_CALLBACK_NUMBER":
-        return "I didn't catch the number. You can say it digit by digit, like 678 462 4453."
+        return "I didn't catch the number. Please say it digit by digit, like 678 462 4453."
     if state == "COLLECTING_CALLER_NAME":
         return "I didn't catch the name. Please say your first and last name."
     return "Sorry, I didn't catch that. Could you say that again?"
@@ -101,7 +101,8 @@ def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | 
         session.last_reply_text = reply_text
         _log_streaming_voice(
             f"transcript={normalized_transcript!r} state_before={state_before} "
-            f"extracted_fields={{}} state_after={state_before} reply={reply_text!r}"
+            f"extracted_fields={{}} state_after={state_before} "
+            f"reply={reply_text!r} fallback_used=true"
         )
         return StreamingReplyPlan(
             transcript_text=None,
@@ -140,7 +141,7 @@ def maybe_transcript_to_reply(session: StreamingSession, transcript_text: str | 
         f"transcript={normalized_transcript!r} state_before={state_before} "
         f"extracted_fields={result.fields} digit_buffer={session.digit_buffer!r} "
         f"slot_data_after_merge={slot_data_after_merge} "
-        f"state_after={state_after} reply={reply_text!r}"
+        f"state_after={state_after} reply={reply_text!r} fallback_used=true"
     )
     return StreamingReplyPlan(
         transcript_text=normalized_transcript,
