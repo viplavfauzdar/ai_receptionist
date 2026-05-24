@@ -16,3 +16,8 @@ frontend/.env.local
 
 # Editor
 .vscode/
+
+.claude/
+.coverage
+*.db
+receptionist.db
