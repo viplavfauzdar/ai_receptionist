@@ -4,7 +4,9 @@ from app.ai import (
     BusinessContext,
     SessionContext,
     detect_and_respond,
+    extract_phone_digits_fragment,
     format_phone_number_for_speech,
+    normalize_us_phone_number,
 )
 
 
@@ -18,6 +20,23 @@ def test_format_phone_number_for_speech_keeps_plus_prefix():
 
 def test_format_phone_number_for_speech_handles_non_digit_string():
     assert format_phone_number_for_speech(" ext ") == "ext"
+
+
+def test_normalize_us_phone_number_accepts_10_and_11_digit_numbers():
+    assert normalize_us_phone_number("6784624453") == "6784624453"
+    assert normalize_us_phone_number("+16784624453") == "16784624453"
+
+
+def test_phone_number_extraction_supports_spaced_and_spoken_digits():
+    assert ai_module._extract_phone_number("678 462 4453") == "6784624453"
+    assert ai_module._extract_phone_number("my number is 678-462-4453") == "6784624453"
+    assert ai_module._extract_phone_number("6 7 8 4 6 2 4 4 5 3") == "6784624453"
+    assert ai_module._extract_phone_number("six seven eight four six two four four five three") == "6784624453"
+
+
+def test_extract_phone_digits_fragment_supports_spoken_and_split_digits():
+    assert extract_phone_digits_fragment("six seven eight") == "678"
+    assert extract_phone_digits_fragment("4 6 2") == "462"
 
 
 def test_openai_client_helper_returns_none_without_key(env_overrides):
@@ -50,7 +69,13 @@ def test_system_prompt_uses_builtin_default_when_file_missing(monkeypatch: pytes
 
 
 def test_requested_time_extraction_handles_day_and_time():
-    assert ai_module._extract_requested_time("next Tuesday at 3 pm please") == "Tuesday at 3 pm please"
+    assert ai_module._extract_requested_time("next Tuesday at 3 pm please") == "Tuesday at 3 pm"
+
+
+def test_appointment_time_extraction_handles_spoken_and_short_time_phrases():
+    assert ai_module._extract_appointment_time("three pm") == "3 pm"
+    assert ai_module._extract_appointment_time("2:30", allow_bare_hour=True) == "2:30"
+    assert ai_module._extract_appointment_time("2", allow_bare_hour=True) == "2"
 
 
 def test_fallback_mode_returns_booking_response(env_overrides):
@@ -228,6 +253,19 @@ def test_openai_timeout_gracefully_falls_back(mock_openai):
     result = detect_and_respond("What are your hours?")
     assert result.intent == "BUSINESS_HOURS"
     assert result.response.startswith("Our hours are")
+
+
+def test_force_fallback_reason_skips_llm_call(env_overrides, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(ai_module.settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(ai_module, "_get_client", lambda: (_ for _ in ()).throw(AssertionError("LLM should not run")))
+    result = detect_and_respond(
+        "What are your hours?",
+        BusinessContext(),
+        SessionContext(),
+        force_fallback_reason="llm_limit_exceeded",
+    )
+    assert result.intent == "BUSINESS_HOURS"
+    assert result.response == "Our hours are Mon-Fri 9 AM to 5 PM."
 
 
 def test_business_context_influences_fallback_response(env_overrides):

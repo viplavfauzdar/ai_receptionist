@@ -1,6 +1,7 @@
 import json
+from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -17,12 +18,16 @@ from .calendar_service import (
     CalendarServiceError,
     build_appointment_window,
     check_calendar_availability,
+    create_google_oauth_authorization_url,
     create_calendar_booking,
+    exchange_google_oauth_code,
+    list_google_calendars,
 )
 from .config import settings
 from .db import Base, ensure_sqlite_compatibility, engine, get_db
 from .models import AppointmentRequest, Business, CallLog, CallSession
-from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut
+from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut, GoogleCalendarSelection
+from .streaming import streaming_router
 
 Base.metadata.create_all(bind=engine)
 ensure_sqlite_compatibility()
@@ -36,6 +41,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+app.include_router(streaming_router)
 
 
 @app.get("/")
@@ -131,6 +138,19 @@ def _build_business_context(business: Business | None) -> BusinessContext:
     )
 
 
+def _get_business_or_404(db: Session, business_id: int) -> Business:
+    business = db.query(Business).filter(Business.id == business_id).first()
+    if business is None:
+        raise HTTPException(status_code=404, detail="Business not found")
+    return business
+
+
+def _get_google_oauth_redirect_uri(request: Request) -> str:
+    if settings.google_oauth_redirect_uri:
+        return settings.google_oauth_redirect_uri
+    return str(request.url_for("google_oauth_callback"))
+
+
 def _get_display_business(db: Session) -> BusinessContext:
     business = db.query(Business).order_by(Business.created_at.desc()).first()
     return _build_business_context(business)
@@ -169,15 +189,15 @@ def _get_or_create_session(
     call_sid: str | None,
     from_number: str | None,
     to_number: str | None,
-) -> CallSession | None:
+) -> tuple[CallSession | None, bool]:
     if not call_sid:
-        return None
+        return None, False
 
     session = db.query(CallSession).filter(CallSession.call_sid == call_sid).first()
     if session:
         session.from_number = from_number
         session.to_number = to_number
-        return session
+        return session, False
 
     session = CallSession(
         call_sid=call_sid,
@@ -187,11 +207,13 @@ def _get_or_create_session(
         current_state="NEW",
         slot_data_json="{}",
         transcript_json="[]",
+        turn_count=0,
+        llm_call_count=0,
         is_active=True,
     )
     db.add(session)
     db.flush()
-    return session
+    return session, True
 
 
 def _build_session_context(session: CallSession | None) -> SessionContext:
@@ -256,6 +278,77 @@ def _build_requested_time(slot_data: dict[str, str]) -> str | None:
         )
         or None
     )
+
+
+def _build_terminal_voice_response(message: str) -> Response:
+    response = VoiceResponse()
+    response.say(message)
+    response.hangup()
+    return Response(content=str(response), media_type="application/xml")
+
+
+def _record_protection_log(
+    db: Session,
+    *,
+    reason: str,
+    call_sid: str | None,
+    from_number: str | None,
+    to_number: str | None,
+    call_status: str | None,
+    ai_response: str,
+    business_id: int | None = None,
+    speech_input: str | None = None,
+    session: CallSession | None = None,
+) -> None:
+    _log_voice(
+        "request_protection "
+        f"reason={reason} call_sid={call_sid} from_number={from_number} to_number={to_number}"
+    )
+    if session is not None:
+        session.last_protection_reason = reason
+    db.add(
+        CallLog(
+            business_id=business_id,
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            speech_input=speech_input,
+            ai_response=ai_response,
+            call_status=call_status,
+            detected_intent=session.current_intent if session is not None else "GENERAL_QUESTION",
+            intent_data=json.dumps(
+                {
+                    "intent": session.current_intent if session is not None else "GENERAL_QUESTION",
+                    "state": session.current_state if session is not None else "NEW",
+                    "response": ai_response,
+                    "fields": _load_json_dict(session.slot_data_json) if session is not None else {},
+                }
+            ),
+            protection_reason=reason,
+        )
+    )
+
+
+def _count_recent_calls_for_number(db: Session, from_number: str) -> int:
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    return (
+        db.query(CallSession)
+        .filter(
+            CallSession.from_number == from_number,
+            CallSession.created_at >= cutoff,
+        )
+        .count()
+    )
+
+
+def _is_rate_limited_new_call(db: Session, from_number: str | None) -> bool:
+    if not settings.enable_basic_rate_limiting or not from_number:
+        return False
+    return _count_recent_calls_for_number(db, from_number) >= settings.max_new_calls_per_number_per_hour
+
+
+def _is_terminal_call_status(call_status: str | None) -> bool:
+    return call_status in {"completed", "canceled", "failed", "busy", "no-answer"}
 
 
 def _should_create_calendar_event(result_intent: str, result_state: str, slot_data: dict[str, str]) -> bool:
@@ -353,7 +446,39 @@ async def voice(request: Request, db: Session = Depends(get_db)):
     from_number = form.get("From")
     to_number = form.get("To")
     call_status = form.get("CallStatus")
-    session = _get_or_create_session(db, call_sid, from_number, to_number)
+
+    if not call_sid or not from_number:
+        prompt = "Sorry, we could not process this call. Please try again later."
+        _record_protection_log(
+            db,
+            reason="malformed_request",
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            call_status=call_status,
+            ai_response=prompt,
+            speech_input=speech,
+        )
+        db.commit()
+        return _build_terminal_voice_response(prompt)
+
+    existing_session = db.query(CallSession).filter(CallSession.call_sid == call_sid).first()
+    if existing_session is None and _is_rate_limited_new_call(db, from_number):
+        prompt = "We are receiving too many calls from this number right now. Please try again later."
+        _record_protection_log(
+            db,
+            reason="caller_rate_limited",
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            call_status=call_status,
+            ai_response=prompt,
+            speech_input=speech,
+        )
+        db.commit()
+        return _build_terminal_voice_response(prompt)
+
+    session, _ = _get_or_create_session(db, call_sid, from_number, to_number)
     session_context = _build_session_context(session)
     business = _resolve_business(db, to_number)
     business_context = _build_business_context(business)
@@ -365,6 +490,27 @@ async def voice(request: Request, db: Session = Depends(get_db)):
     )
 
     response = VoiceResponse()
+
+    if session is not None and session.turn_count >= settings.max_call_turns:
+        prompt = "We need to end this call for now. Please call back if you still need help."
+        session.is_active = False
+        _record_protection_log(
+            db,
+            reason="turn_limit_exceeded",
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            call_status=call_status,
+            ai_response=prompt,
+            business_id=business_context.id,
+            speech_input=speech,
+            session=session,
+        )
+        db.commit()
+        return _build_terminal_voice_response(prompt)
+
+    if session is not None:
+        session.turn_count = (session.turn_count or 0) + 1
 
     if not speech:
         merged_slot_data = dict(session_context.slot_data)
@@ -379,6 +525,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                 )
                 session.current_state = "GREETING_SENT"
                 session.slot_data_json = json.dumps(merged_slot_data)
+                session.last_protection_reason = None
                 session.is_active = True
                 db.commit()
             response.append(gather)
@@ -393,6 +540,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                 _append_transcript(session_context.transcript, "assistant", prompt)
             )
             session.slot_data_json = json.dumps(merged_slot_data)
+            session.last_protection_reason = None
             session.is_active = not should_end_call
 
         log = CallLog(
@@ -412,6 +560,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                     "fields": merged_slot_data,
                 }
             ),
+            protection_reason=None,
         )
         db.add(log)
         db.commit()
@@ -425,7 +574,24 @@ async def voice(request: Request, db: Session = Depends(get_db)):
 
     transcript = _append_transcript(session_context.transcript, "user", speech)
     session_context.transcript = transcript
-    result = detect_and_respond(speech, business_context, session_context)
+    protection_reason: str | None = None
+    llm_limit_exceeded = (
+        session is not None
+        and bool(settings.openai_api_key)
+        and session.llm_call_count >= settings.max_llm_calls_per_session
+    )
+    if llm_limit_exceeded:
+        protection_reason = "llm_limit_exceeded"
+        result = detect_and_respond(
+            speech,
+            business_context,
+            session_context,
+            force_fallback_reason=protection_reason,
+        )
+    else:
+        if session is not None and settings.openai_api_key:
+            session.llm_call_count = (session.llm_call_count or 0) + 1
+        result = detect_and_respond(speech, business_context, session_context)
     merged_slot_data = _clear_silence_count(_merge_session_slots(session_context.slot_data, result.fields))
     speech_safe_response = _build_speech_safe_response(
         result.intent,
@@ -451,9 +617,18 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                     timezone_str=settings.google_timezone,
                     duration_minutes=settings.appointment_duration_minutes,
                 )
+                business_token_json = business.google_token_json if business is not None else None
+                business_calendar_id = (
+                    business.google_calendar_id
+                    if business is not None and business.google_calendar_connected and business.google_calendar_id
+                    else None
+                )
                 availability = check_calendar_availability(
                     start=requested_start,
                     end=requested_end,
+                    token_json=business_token_json,
+                    calendar_id=business_calendar_id,
+                    timezone_str=settings.google_timezone,
                 )
                 if not availability.available:
                     speech_safe_response = _calendar_unavailable_with_suggestion_response(
@@ -466,6 +641,9 @@ async def voice(request: Request, db: Session = Depends(get_db)):
                     appointment_day=merged_slot_data["appointment_day"],
                     appointment_time=merged_slot_data["appointment_time"],
                     notes=speech,
+                    token_json=business_token_json,
+                    calendar_id=business_calendar_id,
+                    timezone_str=settings.google_timezone,
                 )
                 appointment.calendar_event_id = calendar_booking.event_id
                 appointment.calendar_event_link = calendar_booking.html_link
@@ -498,6 +676,7 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         call_status=call_status,
         detected_intent=result.intent,
         intent_data=result.to_json(),
+        protection_reason=protection_reason,
     )
     db.add(log)
 
@@ -506,7 +685,8 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         session.current_state = result.state
         session.slot_data_json = json.dumps(merged_slot_data)
         session.transcript_json = json.dumps(updated_transcript)
-        session.is_active = call_status not in {"completed", "canceled", "failed", "busy", "no-answer"}
+        session.last_protection_reason = protection_reason
+        session.is_active = not _is_terminal_call_status(call_status)
 
     db.commit()
 
@@ -558,6 +738,82 @@ def create_business(payload: BusinessCreate, db: Session = Depends(get_db)):
 @app.get("/api/businesses", response_model=list[BusinessOut])
 def list_businesses(db: Session = Depends(get_db)):
     return db.query(Business).order_by(Business.created_at.desc()).all()
+
+
+@app.get("/api/integrations/google/start")
+def google_integration_start(business_id: int, request: Request, db: Session = Depends(get_db)):
+    business = _get_business_or_404(db, business_id)
+    try:
+        authorization_url = create_google_oauth_authorization_url(
+            business_id=business.id,
+            redirect_uri=_get_google_oauth_redirect_uri(request),
+        )
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"business_id": business.id, "authorization_url": authorization_url}
+
+
+@app.get("/api/integrations/google/callback", name="google_oauth_callback")
+def google_oauth_callback(code: str, state: str, request: Request, db: Session = Depends(get_db)):
+    try:
+        business_id = int(state)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    business = _get_business_or_404(db, business_id)
+    try:
+        result = exchange_google_oauth_code(
+            business_id=business.id,
+            code=code,
+            redirect_uri=_get_google_oauth_redirect_uri(request),
+        )
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    business.google_token_json = result.token_json
+    business.google_account_email = result.account_email
+    business.google_calendar_connected = True
+    if not business.google_calendar_id:
+        business.google_calendar_id = settings.google_calendar_id
+    db.commit()
+    db.refresh(business)
+    return {
+        "business_id": business.id,
+        "google_calendar_connected": business.google_calendar_connected,
+        "google_account_email": business.google_account_email,
+        "google_calendar_id": business.google_calendar_id,
+    }
+
+
+@app.get("/api/integrations/google/calendars")
+def google_integration_calendars(business_id: int, db: Session = Depends(get_db)):
+    business = _get_business_or_404(db, business_id)
+    if not business.google_token_json:
+        raise HTTPException(status_code=400, detail="Google Calendar is not connected for this business")
+    try:
+        calendars = list_google_calendars(token_json=business.google_token_json)
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "business_id": business.id,
+        "google_account_email": business.google_account_email,
+        "calendars": calendars,
+    }
+
+
+@app.post("/api/integrations/google/calendar/select")
+def google_integration_calendar_select(payload: GoogleCalendarSelection, db: Session = Depends(get_db)):
+    business = _get_business_or_404(db, payload.business_id)
+    if not business.google_token_json:
+        raise HTTPException(status_code=400, detail="Google Calendar is not connected for this business")
+    business.google_calendar_id = payload.calendar_id
+    business.google_calendar_connected = True
+    db.commit()
+    db.refresh(business)
+    return {
+        "business_id": business.id,
+        "google_calendar_connected": business.google_calendar_connected,
+        "google_calendar_id": business.google_calendar_id,
+    }
 
 
 @app.post("/api/demo-business", response_model=BusinessOut)

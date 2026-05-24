@@ -24,10 +24,18 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     original = {
         "openai_api_key": ai_module.settings.openai_api_key,
         "openai_model": ai_module.settings.openai_model,
+        "enable_streaming_voice_experiment": ai_module.settings.enable_streaming_voice_experiment,
+        "streaming_ws_path": ai_module.settings.streaming_ws_path,
+        "streaming_voice_route": ai_module.settings.streaming_voice_route,
+        "max_call_turns": ai_module.settings.max_call_turns,
+        "max_llm_calls_per_session": ai_module.settings.max_llm_calls_per_session,
+        "enable_basic_rate_limiting": ai_module.settings.enable_basic_rate_limiting,
+        "max_new_calls_per_number_per_hour": ai_module.settings.max_new_calls_per_number_per_hour,
         "google_calendar_enabled": ai_module.settings.google_calendar_enabled,
         "google_calendar_id": ai_module.settings.google_calendar_id,
         "google_client_secrets_file": ai_module.settings.google_client_secrets_file,
         "google_token_file": ai_module.settings.google_token_file,
+        "google_oauth_redirect_uri": ai_module.settings.google_oauth_redirect_uri,
         "google_timezone": ai_module.settings.google_timezone,
         "appointment_duration_minutes": ai_module.settings.appointment_duration_minutes,
         "twilio_auth_token": ai_module.settings.twilio_auth_token,
@@ -36,10 +44,18 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     }
     monkeypatch.setattr(ai_module.settings, "openai_api_key", "")
     monkeypatch.setattr(ai_module.settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(ai_module.settings, "enable_streaming_voice_experiment", False)
+    monkeypatch.setattr(ai_module.settings, "streaming_ws_path", "/ws/media-stream")
+    monkeypatch.setattr(ai_module.settings, "streaming_voice_route", "/voice-stream")
+    monkeypatch.setattr(ai_module.settings, "max_call_turns", 12)
+    monkeypatch.setattr(ai_module.settings, "max_llm_calls_per_session", 6)
+    monkeypatch.setattr(ai_module.settings, "enable_basic_rate_limiting", True)
+    monkeypatch.setattr(ai_module.settings, "max_new_calls_per_number_per_hour", 5)
     monkeypatch.setattr(ai_module.settings, "google_calendar_enabled", False)
     monkeypatch.setattr(ai_module.settings, "google_calendar_id", "primary")
     monkeypatch.setattr(ai_module.settings, "google_client_secrets_file", "./credentials.json")
     monkeypatch.setattr(ai_module.settings, "google_token_file", "./token.json")
+    monkeypatch.setattr(ai_module.settings, "google_oauth_redirect_uri", "")
     monkeypatch.setattr(ai_module.settings, "google_timezone", "America/New_York")
     monkeypatch.setattr(ai_module.settings, "appointment_duration_minutes", 30)
     monkeypatch.setattr(ai_module.settings, "twilio_auth_token", "test-twilio-token")

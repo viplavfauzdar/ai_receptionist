@@ -5,12 +5,17 @@ import pytest
 
 from app.calendar_service import (
     CalendarAvailabilityResult,
+    GoogleOAuthResult,
     CalendarServiceError,
     _load_credentials,
+    _load_credentials_from_token_json,
+    create_google_oauth_authorization_url,
+    exchange_google_oauth_code,
     get_calendar_service,
     build_appointment_window,
     check_calendar_availability,
     create_calendar_booking,
+    list_google_calendars,
     run_local_oauth_authorization,
 )
 from app.config import settings
@@ -93,7 +98,7 @@ def test_create_calendar_booking_returns_calendar_metadata(monkeypatch: pytest.M
         def events(self):
             return FakeEvents()
 
-    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda: FakeService())
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda **_: FakeService())
 
     result = create_calendar_booking(
         caller_name="Jane Smith",
@@ -126,7 +131,7 @@ def test_check_calendar_availability_returns_available_when_no_conflicts(monkeyp
         def events(self):
             return FakeEvents()
 
-    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda: FakeService())
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda **_: FakeService())
     monkeypatch.setattr(settings, "google_calendar_id", "primary")
 
     start = datetime(2026, 4, 7, 15, 0, tzinfo=ZoneInfo("America/New_York"))
@@ -176,7 +181,7 @@ def test_check_calendar_availability_blocks_overlapping_events_and_ignores_cance
         def events(self):
             return FakeEvents()
 
-    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda: FakeService())
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda **_: FakeService())
 
     result = check_calendar_availability(
         start=datetime(2026, 4, 7, 15, 0, tzinfo=ZoneInfo("America/New_York")),
@@ -208,7 +213,7 @@ def test_check_calendar_availability_allows_exact_boundary_gap(monkeypatch: pyte
         def events(self):
             return FakeEvents()
 
-    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda: FakeService())
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda **_: FakeService())
 
     result = check_calendar_availability(
         start=datetime(2026, 4, 7, 15, 30, tzinfo=ZoneInfo("America/New_York")),
@@ -223,7 +228,7 @@ def test_get_calendar_service_uses_loaded_credentials(monkeypatch: pytest.Monkey
     fake_credentials = object()
     captured = {}
 
-    monkeypatch.setattr("app.calendar_service._load_credentials", lambda: fake_credentials)
+    monkeypatch.setattr("app.calendar_service._load_credentials", lambda **_: fake_credentials)
     monkeypatch.setattr(
         "app.calendar_service.build",
         lambda api, version, credentials: captured.update(
@@ -238,11 +243,39 @@ def test_get_calendar_service_uses_loaded_credentials(monkeypatch: pytest.Monkey
     assert captured == {"api": "calendar", "version": "v3", "credentials": fake_credentials}
 
 
+def test_load_credentials_from_token_json_builds_credentials(monkeypatch: pytest.MonkeyPatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        "app.calendar_service.Credentials.from_authorized_user_info",
+        lambda payload, scopes: captured.update({"payload": payload, "scopes": scopes}) or "creds",
+    )
+
+    creds = _load_credentials_from_token_json('{"refresh_token":"x","client_id":"id"}')
+
+    assert creds == "creds"
+    assert captured["payload"]["client_id"] == "id"
+    assert captured["scopes"]
+
+
 def test_load_credentials_raises_when_token_missing(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "google_token_file", "./missing-token.json")
 
     with pytest.raises(CalendarServiceError):
         _load_credentials()
+
+
+def test_load_credentials_uses_token_json_when_provided(monkeypatch: pytest.MonkeyPatch):
+    class FakeCredentials:
+        valid = True
+        expired = False
+        refresh_token = None
+
+    monkeypatch.setattr("app.calendar_service._load_credentials_from_token_json", lambda payload: FakeCredentials())
+
+    credentials = _load_credentials('{"refresh_token":"x"}')
+
+    assert credentials.valid is True
 
 
 def test_load_credentials_refreshes_expired_token(monkeypatch: pytest.MonkeyPatch, tmp_path):
@@ -305,3 +338,93 @@ def test_run_local_oauth_authorization_writes_token(monkeypatch: pytest.MonkeyPa
     assert token_path.exists()
     assert "calendar.events" in token_path.read_text()
     assert credentials.to_json().startswith("{")
+
+
+def test_create_google_oauth_authorization_url_returns_url(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    secrets_path = tmp_path / "credentials.json"
+    secrets_path.write_text("{}")
+    monkeypatch.setattr(settings, "google_client_secrets_file", str(secrets_path))
+
+    class FakeFlow:
+        redirect_uri = None
+
+        def authorization_url(self, **kwargs):
+            assert kwargs["access_type"] == "offline"
+            assert kwargs["prompt"] == "consent"
+            return ("https://accounts.google.com/o/oauth2/auth?state=7", "7")
+
+    monkeypatch.setattr(
+        "app.calendar_service.Flow.from_client_secrets_file",
+        lambda path, scopes, state=None: FakeFlow(),
+    )
+
+    url = create_google_oauth_authorization_url(
+        business_id=7,
+        redirect_uri="http://127.0.0.1:8000/api/integrations/google/callback",
+    )
+
+    assert "state=7" in url
+
+
+def test_exchange_google_oauth_code_returns_token_and_email(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    secrets_path = tmp_path / "credentials.json"
+    secrets_path.write_text("{}")
+    monkeypatch.setattr(settings, "google_client_secrets_file", str(secrets_path))
+
+    class FakeCredentials:
+        def to_json(self):
+            return '{"refresh_token":"refresh","token":"fresh"}'
+
+    class FakeFlow:
+        def __init__(self):
+            self.credentials = FakeCredentials()
+            self.redirect_uri = None
+
+        def fetch_token(self, code):
+            assert code == "oauth-code"
+
+    monkeypatch.setattr(
+        "app.calendar_service.Flow.from_client_secrets_file",
+        lambda path, scopes, state=None: FakeFlow(),
+    )
+    monkeypatch.setattr("app.calendar_service._get_google_account_email", lambda credentials: "owner@example.com")
+
+    result = exchange_google_oauth_code(
+        business_id=5,
+        code="oauth-code",
+        redirect_uri="http://127.0.0.1:8000/api/integrations/google/callback",
+    )
+
+    assert result == GoogleOAuthResult(
+        token_json='{"refresh_token":"refresh","token":"fresh"}',
+        account_email="owner@example.com",
+    )
+
+
+def test_list_google_calendars_returns_simple_payload(monkeypatch: pytest.MonkeyPatch):
+    class FakeList:
+        def execute(self):
+            return {
+                "items": [
+                    {"id": "primary", "summary": "Primary", "primary": True},
+                    {"id": "team@example.com", "summary": "Team"},
+                    {"summary": "Missing id"},
+                ]
+            }
+
+    class FakeCalendarList:
+        def list(self):
+            return FakeList()
+
+    class FakeService:
+        def calendarList(self):
+            return FakeCalendarList()
+
+    monkeypatch.setattr("app.calendar_service.get_calendar_service", lambda **_: FakeService())
+
+    calendars = list_google_calendars(token_json='{"refresh_token":"x"}')
+
+    assert calendars == [
+        {"id": "primary", "name": "Primary", "primary": "true"},
+        {"id": "team@example.com", "name": "Team", "primary": "false"},
+    ]

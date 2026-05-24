@@ -4,10 +4,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    streaming_stt_model: str = "gpt-4o-mini-transcribe"
+    streaming_stt_buffer_bytes: int = 32000
+    streaming_tts_model: str = "gpt-4o-mini-tts"
+    streaming_tts_voice: str = "alloy"
+    enable_streaming_voice_experiment: bool = False
+    streaming_ws_path: str = "/ws/media-stream"
+    streaming_voice_route: str = "/voice-stream"
+    max_call_turns: int = 12
+    max_llm_calls_per_session: int = 6
+    enable_basic_rate_limiting: bool = True
+    max_new_calls_per_number_per_hour: int = 5
     google_calendar_enabled: bool = False
     google_calendar_id: str = "primary"
     google_client_secrets_file: str = "./credentials.json"
     google_token_file: str = "./token.json"
+    google_oauth_redirect_uri: str = ""
     google_timezone: str = "America/New_York"
     appointment_duration_minutes: int = 30
     twilio_auth_token: str = ""

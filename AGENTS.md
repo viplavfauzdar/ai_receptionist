@@ -25,6 +25,21 @@ Agents should prefer small, targeted changes that preserve the current MVP struc
 - `frontend/app/onboarding/page.tsx`: onboarding UI
 - `frontend/app/globals.css`: shared styles
 
+## Worktree Setup
+
+Use the dedicated worktrees for active development:
+
+- backend work: `/Users/viplavfauzdar/Projects/ai_receptionist_backend` on branch `backend-work`
+- frontend work: `/Users/viplavfauzdar/Projects/ai_receptionist_frontend` on branch `frontend-work`
+- main checkout: `/Users/viplavfauzdar/Projects/ai_receptionist`
+
+Rules:
+
+- Do backend changes from the `backend-work` worktree unless explicitly told otherwise.
+- Do frontend changes from the `frontend-work` worktree unless explicitly told otherwise.
+- Commit from the worktree that owns the change.
+- When starting a new session, confirm the physical `cwd` and branch before making edits.
+
 ## Run Commands
 
 Backend:

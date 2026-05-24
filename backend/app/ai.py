@@ -14,6 +14,24 @@ INTENTS = {
     "GENERAL_QUESTION",
 }
 
+NUMBER_WORDS = {
+    "zero": 0,
+    "oh": 0,
+    "o": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
 SAFE_STATES = {
     "NEW",
     "GREETING_SENT",
@@ -112,9 +130,40 @@ def _get_client() -> OpenAI | None:
     return OpenAI(api_key=settings.openai_api_key)
 
 
+def normalize_us_phone_number(phone_number: str) -> str | None:
+    digits = "".join(char for char in phone_number if char.isdigit())
+    if len(digits) == 10:
+        return digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return digits
+    return None
+
+
+def extract_phone_digits_fragment(user_input: str) -> str:
+    numeric_digits = "".join(char for char in user_input if char.isdigit())
+    if numeric_digits:
+        return numeric_digits
+
+    token_pattern = re.compile(
+        r"\b(?:zero|oh|o|one|two|three|four|five|six|seven|eight|nine|\d)\b",
+        flags=re.IGNORECASE,
+    )
+    digit_tokens = [
+        str(NUMBER_WORDS[token.lower()]) if token.lower() in NUMBER_WORDS else token
+        for token in token_pattern.findall(user_input)
+    ]
+    return "".join(digit_tokens)
+
+
 def _extract_phone_number(user_input: str) -> str | None:
     match = re.search(r"(\+?\d[\d\-\(\) ]{7,}\d)", user_input)
-    return match.group(1).strip() if match else None
+    if match:
+        return normalize_us_phone_number(match.group(1))
+
+    digit_fragment = extract_phone_digits_fragment(user_input)
+    if digit_fragment:
+        return normalize_us_phone_number(digit_fragment)
+    return None
 
 
 def _extract_caller_name(user_input: str) -> str | None:
@@ -151,16 +200,13 @@ def format_phone_number_for_speech(phone_number: str) -> str:
 
 
 def _extract_requested_time(user_input: str) -> str | None:
-    patterns = [
-        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b(?:[^.?!,;]*)",
-        r"\b(?:today|tomorrow|next week|next monday|next tuesday|next wednesday|next thursday|next friday)\b(?:[^.?!,;]*)",
-        r"\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b(?:[^.?!,;]*)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, user_input, flags=re.IGNORECASE)
-        if match:
-            return match.group(0).strip()
-    return None
+    day = _extract_appointment_day(user_input)
+    time = _extract_appointment_time(user_input, allow_bare_hour=True)
+    if day and time:
+        return f"{day} at {time}"
+    if day:
+        return day
+    return time
 
 
 def _extract_appointment_day(user_input: str) -> str | None:
@@ -175,10 +221,46 @@ def _extract_appointment_day(user_input: str) -> str | None:
     return None
 
 
-def _extract_appointment_time(user_input: str) -> str | None:
-    match = re.search(r"\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b", user_input, flags=re.IGNORECASE)
+def _normalize_time_match(hour: str, meridiem: str | None = None, minute: str | None = None) -> str:
+    hour_clean = hour.strip().lower()
+    if hour_clean in NUMBER_WORDS:
+        hour_clean = str(NUMBER_WORDS[hour_clean])
+    meridiem_clean = (meridiem or "").strip().lower().replace(".", "")
+    minute_clean = (minute or "").strip()
+
+    if minute_clean:
+        if meridiem_clean:
+            return f"{hour_clean}:{minute_clean} {meridiem_clean}"
+        return f"{hour_clean}:{minute_clean}"
+    if meridiem_clean:
+        return f"{hour_clean} {meridiem_clean}"
+    return hour_clean
+
+
+def _extract_appointment_time(user_input: str, *, allow_bare_hour: bool = False) -> str | None:
+    match = re.search(
+        r"\b(?P<hour>\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        r"(?::(?P<minute>\d{2}))?\s?(?P<meridiem>am|pm)\b",
+        user_input,
+        flags=re.IGNORECASE,
+    )
     if match:
-        return match.group(0).strip()
+        return _normalize_time_match(
+            match.group("hour"),
+            match.group("meridiem"),
+            match.group("minute"),
+        )
+    if allow_bare_hour:
+        match = re.search(r"\b(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))\b", user_input, flags=re.IGNORECASE)
+        if match:
+            return _normalize_time_match(match.group("hour"), None, match.group("minute"))
+        match = re.search(
+            r"\b(?P<hour>\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b",
+            user_input,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return _normalize_time_match(match.group("hour"))
     return None
 
 
@@ -285,7 +367,7 @@ def _default_response_for_intent(intent: str, business: BusinessContext, slot_da
         if slot_data.get("callback_number"):
             return "Thanks. What name should I put on that callback request?"
         return "I can have someone call you back. What number should we use?"
-    return "Thanks for calling. How can I help you today?"
+    return "Sorry, I didn't catch that. Could you say that again?"
 
 
 def _normalize_intent(intent: object) -> str | None:
@@ -341,7 +423,10 @@ def _fallback_result(
 
     phone_number = _extract_phone_number(user_input)
     appointment_day = _extract_appointment_day(user_input)
-    appointment_time = _extract_appointment_time(user_input)
+    appointment_time = _extract_appointment_time(
+        user_input,
+        allow_bare_hour=session.current_state == "COLLECTING_APPOINTMENT_TIME",
+    )
     caller_name = _extract_caller_name(user_input)
     stripped_input = user_input.strip(" .,!?:;")
 
@@ -390,7 +475,7 @@ def _fallback_result(
     return ReceptionistResult(
         intent=intent,
         state="GENERAL_ASSISTANCE",
-        response="Thanks for calling. How can I help you today?",
+        response="Sorry, I didn't catch that. Could you say that again?",
         fields=fields,
     )
 
@@ -456,6 +541,7 @@ def detect_and_respond(
     user_input: str,
     business: BusinessContext | None = None,
     session: SessionContext | None = None,
+    force_fallback_reason: str | None = None,
 ) -> ReceptionistResult:
     business = business or BusinessContext()
     session = session or SessionContext()
@@ -468,6 +554,10 @@ def detect_and_respond(
             response="Could you please repeat that?",
             fields={},
         )
+
+    if force_fallback_reason:
+        _log_ai_mode(f"mode=fallback reason={force_fallback_reason}")
+        return _fallback_result(user_input, business, session)
 
     client = _get_client()
     if client is None:

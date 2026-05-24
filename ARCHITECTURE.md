@@ -9,10 +9,12 @@ At a high level:
 - Twilio receives the phone call and sends webhook requests to the backend.
 - `ngrok` is used in local development to expose the backend to Twilio.
 - FastAPI handles the `/voice` webhook and returns TwiML.
+- FastAPI also exposes a separate experimental Twilio Media Streams path for future lower-latency voice.
 - SQLite stores business records, call logs, appointment requests, and per-call session state.
 - OpenAI is used to generate structured receptionist responses when an API key is configured.
 - A fallback rule-based path is used when the API key is missing or the model output is unusable.
 - Twilio signatures are validated on `/voice` by default before any session or DB work happens.
+- Lightweight abuse protections on `/voice` stop malformed requests, runaway sessions, excessive LLM usage, and repeated spam calls.
 - Completed bookings can optionally create Google Calendar events through a small backend service layer.
 
 The backend is intentionally small. Most logic lives in:
@@ -45,6 +47,16 @@ All `Gather` usage in the current backend is configured with:
 
 The backend is therefore a webhook-driven state machine.
 
+The current primary path remains `POST /voice`.
+
+An experimental parallel path also exists for Twilio bidirectional Media Streams:
+
+1. Twilio sends an HTTP request to `POST /voice-stream`.
+2. The backend responds with TwiML containing `<Connect><Stream>`.
+3. Twilio opens one bidirectional WebSocket to `/ws/media-stream`.
+4. The backend receives `connected`, `start`, `media`, `mark`, and `stop` messages over that socket.
+5. Media frames are buffered in memory for future STT, LLM, and TTS integration.
+
 ### ngrok for Local Development
 
 Twilio cannot reach `localhost` directly. During local development:
@@ -71,6 +83,16 @@ Key modules:
   Skill-style markdown prompt template for the receptionist system message.
 - `backend/app/calendar_service.py`
   Google Calendar OAuth helper, appointment datetime builder, and event insertion.
+- `backend/app/streaming/routes.py`
+  Experimental `POST /voice-stream` route and `/ws/media-stream` WebSocket endpoint.
+- `backend/app/streaming/session.py`
+  In-memory per-stream session state for Twilio Media Streams, including buffered audio and lightweight transcript/state data.
+- `backend/app/streaming/voice.py`
+  Bridge where streaming transcripts feed the existing receptionist response logic.
+- `backend/app/streaming/stt_adapter.py`
+  Twilio mu-law decode, PCM conversion, 8kHz-to-16kHz upsampling, WAV wrapping, and OpenAI-backed STT boundary.
+- `backend/app/streaming/tts_adapter.py`
+  Streaming TTS boundary that synthesizes PCM, converts it to Twilio-compatible mono 8kHz mu-law, and returns outbound media payload bytes.
 - `backend/app/models.py`
   SQLAlchemy ORM models.
 - `backend/app/db.py`
@@ -79,6 +101,33 @@ Key modules:
   Env-backed configuration.
 - `backend/app/schemas.py`
   Pydantic response/request schemas for API routes.
+
+### Experimental Streaming Path
+
+The streaming path is intentionally isolated from the main receptionist flow.
+
+- `POST /voice-stream` returns TwiML with `<Connect><Stream>`
+- that TwiML no longer uses `<Say>`; instead, after the WebSocket `start` event the backend sends the initial business-aware greeting through the same outbound TTS/media path used for assistant replies so the voice stays consistent
+- `/ws/media-stream` accepts Twilio Media Streams WebSocket messages
+- inbound `media` frames are decoded from base64 mu-law, converted to 16-bit PCM, upsampled to 16kHz, buffered, and passed through a narrow STT boundary
+- the streaming STT adapter wraps buffered audio as a mono 16-bit 16kHz WAV before calling the OpenAI transcription API
+- the route uses a configurable STT threshold via `STREAMING_STT_BUFFER_BYTES`, currently `32000` bytes of 16kHz PCM16, to avoid tiny invalid audio uploads while still allowing short phrases to be transcribed
+- a short playback gate suppresses STT buffering while outbound audio is being played back, reducing self-transcription
+- low-energy PCM chunks are skipped before STT invocation
+- if the caller hangs up with buffered audio still waiting below threshold, the route performs one final STT flush on the Twilio `stop` event before removing the session
+- transcription exceptions are handled inside the streaming route so a bad chunk does not terminate the WebSocket session
+- the current STT provider for that boundary is the OpenAI transcription API, configured by `OPENAI_API_KEY` plus `STREAMING_STT_MODEL`
+- when transcript text is produced, the streaming bridge passes it into the existing receptionist logic on a deterministic fallback path
+- the streaming bridge now adds booking-oriented normalization for short phone phrases such as `3 PM`, `three pm`, `2`, `2:30`, `Thursday`, and `tomorrow at 3 PM`, so slot collection can advance even from terse STT output
+- the same bridge now normalizes callback-number phrases from phone-style transcripts, including contiguous digits, spaced digits, dashed digits, and spoken digit words, into a deterministic US phone number string before state progression
+- while the streaming state is `COLLECTING_CALLBACK_NUMBER`, callback digits can now accumulate across multiple transcripts in a small in-memory digit buffer until a valid 10-digit US number or 11-digit number starting with `1` is reached
+- if the same booking collection state would emit the same question twice in a row, the streaming bridge swaps in a state-specific reprompt like `I didn't catch the time. You can say something like 3 PM.`
+- for callback-number collection, the explicit reprompt is `I didn't catch the number. You can say it digit by digit, like 678 462 4453.`
+- reply text then flows through the streaming TTS adapter, which synthesizes audio and converts it to Twilio-compatible mu-law payloads for outbound `media` messages
+- outbound audio is sent back as base64-encoded Twilio `media` payloads containing mono 8kHz mu-law audio
+- TTS exceptions are logged and do not terminate the WebSocket session
+- the existing `POST /voice` path remains the primary production path for booking, calendar, and current receptionist behavior
+- this streaming path is the future direction for lower-latency voice once STT, LLM, and TTS adapters are plugged in
 
 ### SQLite Persistence Layer
 
@@ -121,10 +170,17 @@ Configuration is env-driven:
 - `GOOGLE_CALENDAR_ID`
 - `GOOGLE_CLIENT_SECRETS_FILE`
 - `GOOGLE_TOKEN_FILE`
+- `GOOGLE_OAUTH_REDIRECT_URI`
 - `GOOGLE_TIMEZONE`
 - `APPOINTMENT_DURATION_MINUTES`
 
-Local development uses OAuth desktop-app credentials and a locally stored `token.json`.
+The preferred path is now per-business OAuth onboarding:
+
+- each `businesses` row can store its own Google token JSON
+- each business can select its own destination calendar ID
+- booking and conflict checks prefer the business-linked token and selected calendar at runtime
+
+The legacy `token.json` file flow still exists as a local fallback for businesses that have not completed onboarding yet.
 
 ### CORS Configuration
 
@@ -161,6 +217,13 @@ For local development, signature validation can be disabled explicitly with:
 
 - `DISABLE_TWILIO_SIGNATURE_VALIDATION=true`
 
+Immediately after signature validation, the backend applies lightweight request protections:
+
+- missing `CallSid` or `From` is treated as `malformed_request`
+- new calls can be rate limited by caller number
+- existing sessions can be stopped after `MAX_CALL_TURNS`
+- LLM usage can be capped after `MAX_LLM_CALLS_PER_SESSION`
+
 ### Step 2: Business Lookup
 
 The backend resolves the business using the incoming Twilio `To` number.
@@ -177,7 +240,7 @@ This supports basic multi-tenant routing by Twilio number.
 
 The backend loads or creates a `CallSession` using `CallSid`.
 
-If `CallSid` is missing, the request still works, but no session persistence is used.
+If `CallSid` or `From` is missing, the request is treated as malformed and the route returns a short TwiML apology plus `Hangup` instead of entering the normal session flow.
 
 ### Step 4: Session Context Construction
 
@@ -187,6 +250,8 @@ The backend converts the DB session row into an in-memory session context contai
 - current state
 - accumulated slot values
 - recent transcript
+- turn count
+- LLM call count
 
 This is passed to the AI layer.
 
@@ -204,7 +269,8 @@ If `SpeechResult` is empty:
 If `SpeechResult` is present:
 
 - the user utterance is appended to transcript
-- the AI layer is called
+- the session turn cap is checked before the normal turn logic continues
+- the AI layer is called unless the per-session LLM cap has already been reached
 
 ### Step 6: `detect_and_respond`
 
@@ -224,6 +290,8 @@ It returns a structured result:
   "fields": {}
 }
 ```
+
+If the LLM cap has already been reached for that call, `backend/app/main.py` forces `backend/app/ai.py` into deterministic fallback mode for the rest of the session.
 
 ### Step 7: Slot Extraction and Session Update
 
@@ -245,6 +313,13 @@ Silence tracking also lives in slot storage through:
 ### Step 8: DB Logging
 
 Each spoken turn is logged into `call_logs`.
+
+Protection triggers are also recorded in `call_logs.protection_reason`, using values such as:
+
+- `turn_limit_exceeded`
+- `llm_limit_exceeded`
+- `caller_rate_limited`
+- `malformed_request`
 
 Depending on the state:
 
@@ -299,6 +374,9 @@ Fields:
 - `current_state`
 - `slot_data_json`
 - `transcript_json`
+- `turn_count`
+- `llm_call_count`
+- `last_protection_reason`
 - `is_active`
 - `created_at`
 - `updated_at`
@@ -329,6 +407,8 @@ Typical keys:
 - `caller_name`
 - `silence_count`
 - `request_saved`
+
+Session-wide protection counters such as `turn_count` and `llm_call_count` are stored as first-class columns rather than JSON slots so they can be enforced deterministically at the route layer.
 
 ### State Machine Behavior
 
@@ -511,14 +591,17 @@ When a booking flow reaches completion:
    - `appointment_time`
    - `GOOGLE_TIMEZONE`
    - `APPOINTMENT_DURATION_MINUTES`
-4. The calendar service checks availability on the target calendar for that exact window.
-5. If the window is available, the calendar service inserts a Google Calendar event.
-6. The backend stores:
+4. The route chooses credentials in this order:
+   - `business.google_token_json` plus `business.google_calendar_id` when the business completed onboarding
+   - fallback to the legacy global `token.json` plus `GOOGLE_CALENDAR_ID`
+5. The calendar service checks availability on the target calendar for that exact window.
+6. If the window is available, the calendar service inserts a Google Calendar event.
+7. The backend stores:
    - `calendar_event_id`
    - `calendar_event_link`
    - `scheduled_start`
    - `scheduled_end`
-7. The assistant confirms the booking to the caller.
+8. The assistant confirms the booking to the caller.
 
 If any calendar step fails, the appointment request remains in SQLite and the assistant falls back to manual office confirmation wording.
 
@@ -528,7 +611,49 @@ Overlap rule:
 - an event ending exactly at the proposed start does not block the new slot
 - cancelled events are ignored
 
-## 7. Phone Number Normalization Logic
+## 7. Google Calendar Onboarding Flow
+
+The backend now supports a mock-production SaaS onboarding flow for Google Calendar.
+
+Routes:
+
+- `GET /api/integrations/google/start?business_id=...`
+- `GET /api/integrations/google/callback`
+- `GET /api/integrations/google/calendars?business_id=...`
+- `POST /api/integrations/google/calendar/select`
+
+Flow:
+
+1. A business row already exists in SQLite.
+2. The caller or frontend hits the `start` route with `business_id`.
+3. The backend builds a Google OAuth authorization URL from `GOOGLE_CLIENT_SECRETS_FILE` and `GOOGLE_OAUTH_REDIRECT_URI`.
+4. Google redirects back to `/api/integrations/google/callback` with `code` and `state`.
+5. The backend exchanges the code for tokens, stores the token JSON on the business row, marks the business connected, and stores the Google account email if available.
+6. The `calendars` route uses that stored token to list available calendars from the connected Google account.
+7. The `calendar/select` route saves the chosen `google_calendar_id` on the business row.
+8. Future booking calls for that business use the business-linked token and selected calendar for availability checks and event insertion.
+
+Local redirect URI requirement:
+
+- the Google OAuth client must allow the same callback URI the backend is using
+- for local backend-only testing, that is typically:
+
+```text
+http://127.0.0.1:8000/api/integrations/google/callback
+```
+
+If `GOOGLE_OAUTH_REDIRECT_URI` is unset, the backend derives the callback URL from the incoming request.
+
+### Stored Business Calendar Fields
+
+Each `Business` row can now hold:
+
+- `google_calendar_connected`
+- `google_account_email`
+- `google_calendar_id`
+- `google_token_json`
+
+## 8. Phone Number Normalization Logic
 
 The backend normalizes phone numbers in two different ways:
 
@@ -560,7 +685,7 @@ For 10-digit US numbers:
 
 This formatting is applied in code, not left to LLM wording.
 
-## 8. Testing Strategy
+## 9. Testing Strategy
 
 The backend test suite uses `pytest`.
 
@@ -576,6 +701,8 @@ Current structure:
   direct AI/helper behavior
 - `backend/tests/test_backend_helpers.py`
   DB helper and internal helper branch coverage
+- `backend/tests/test_streaming_routes.py`
+  experimental Media Streams route and WebSocket coverage
 
 ### Mocked OpenAI Calls
 
@@ -611,6 +738,7 @@ The suite currently exercises:
 - route behavior
 - Twilio signature validation
 - CORS behavior for allowed and disallowed origins
+- turn caps, LLM caps, caller rate limiting, and malformed-request handling
 - empty-gather silence handling and repeated-silence hangup behavior
 - mocked Google Calendar success and failure behavior
 - DB writes
@@ -619,7 +747,7 @@ The suite currently exercises:
 - mocked LLM handling
 - phone formatting logic
 
-## 9. How to Run the System Locally
+## 10. How to Run the System Locally
 
 ### Backend
 
@@ -638,12 +766,20 @@ Important local env vars:
 - `GOOGLE_CALENDAR_ID`
 - `GOOGLE_CLIENT_SECRETS_FILE`
 - `GOOGLE_TOKEN_FILE`
+- `GOOGLE_OAUTH_REDIRECT_URI`
 - `GOOGLE_TIMEZONE`
 - `APPOINTMENT_DURATION_MINUTES`
+- `ENABLE_STREAMING_VOICE_EXPERIMENT`
+- `STREAMING_WS_PATH`
+- `STREAMING_VOICE_ROUTE`
 - `TWILIO_AUTH_TOKEN`
 - `DISABLE_TWILIO_SIGNATURE_VALIDATION`
 - `CORS_ALLOWED_ORIGINS`
 - `OPENAI_API_KEY`
+- `MAX_CALL_TURNS`
+- `MAX_LLM_CALLS_PER_SESSION`
+- `ENABLE_BASIC_RATE_LIMITING`
+- `MAX_NEW_CALLS_PER_NUMBER_PER_HOUR`
 - `DATABASE_URL`
 
 ### Frontend
@@ -668,11 +804,19 @@ Set the Twilio phone number voice webhook to:
 https://YOUR-NGROK-URL/voice
 ```
 
+For the experimental streaming path, set the Twilio voice webhook to:
+
+```text
+https://YOUR-NGROK-URL/voice-stream
+```
+
 ### Local Google Calendar OAuth
 
-To authorize the local backend against Google Calendar:
+The preferred local path is now the business-linked onboarding flow through the API routes described above.
 
-1. Place the OAuth desktop client file at `backend/credentials.json`.
+Legacy fallback:
+
+1. Place the client file at `backend/credentials.json`.
 2. Start the backend virtualenv.
 3. Run:
 
@@ -681,9 +825,9 @@ cd backend
 python -m app.calendar_service
 ```
 
-This opens the local consent flow and writes `backend/token.json`.
+This writes `backend/token.json` for the legacy single-account fallback path. It is still supported, but it is no longer the preferred SaaS-style onboarding flow.
 
-## 10. How to Run the Backend Tests
+## 11. How to Run the Backend Tests
 
 Install backend dependencies:
 
@@ -706,13 +850,13 @@ backend/.venv/bin/python -m pytest backend/tests \
   --cov-report=term-missing
 ```
 
-## 11. Known Limitations
+## 12. Known Limitations
 
-### Single-Tenant Google Calendar OAuth
+### Business Tokens Stored Unencrypted
 
-The current Google Calendar implementation uses a single `token.json` file on disk. Only one Google account can be authorized per server instance. Onboarding a second business with a different Google Calendar will overwrite the existing token.
+The backend now stores per-business Google OAuth token JSON in SQLite on the `businesses` table so local testing can simulate the real SaaS onboarding model.
 
-This is a deliberate MVP simplification. The fix is per-business OAuth token storage — store the token payload per `business_id` in the database, encrypted at rest, and load the correct token at booking time.
+This is useful for local mock-production testing, but it is not production-safe as written. The token payload should be encrypted at rest before public deployment.
 
 ### SQLite Not Suitable for Production
 
@@ -736,7 +880,7 @@ The `/api/businesses`, `/api/calls`, and `/api/appointments` routes have no auth
 
 ---
 
-## 12. Future Extensions
+## 13. Future Extensions
 
 ### Multi-Tenant Businesses
 
@@ -752,13 +896,11 @@ Possible next steps:
 
 ### Calendar Integration
 
-Google Calendar integration is implemented for single-tenant local development.
-
-The current implementation uses a single OAuth `token.json` file on disk, which means only one Google account can be authorized per server instance. This is a known limitation.
+Google Calendar integration now supports per-business OAuth onboarding stored in SQLite, with the older single `token.json` path kept only as a local fallback.
 
 Next steps:
 
-- per-business OAuth token storage (token per `business_id` in the DB, encrypted at rest)
+- encrypt per-business OAuth tokens at rest
 - Outlook / Microsoft 365 calendar support
 - reschedule and cancellation flows via voice
 - SMS or email booking confirmation after the call ends
