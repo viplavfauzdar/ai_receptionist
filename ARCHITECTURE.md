@@ -10,6 +10,9 @@ At a high level:
 - `ngrok` is used in local development to expose the backend to Twilio.
 - FastAPI handles the `/voice` webhook and returns TwiML.
 - FastAPI also exposes a separate experimental Twilio Media Streams path for future lower-latency voice.
+- FastAPI also exposes a separate experimental Twilio ConversationRelay path for comparing managed STT/TTS relay behavior against the custom Media Streams implementation.
+- FastAPI also exposes a separate experimental full-duplex skeleton built on Twilio Media Streams, async queues, interruption handling, and pluggable streaming STT/TTS provider interfaces.
+- FastAPI also exposes a separate experimental OpenAI Realtime bridge from Twilio Media Streams to OpenAI Realtime for lower-latency speech-to-speech experiments.
 - SQLite stores business records, call logs, appointment requests, and per-call session state.
 - OpenAI is used to generate structured receptionist responses when an API key is configured.
 - A fallback rule-based path is used when the API key is missing or the model output is unusable.
@@ -57,6 +60,30 @@ An experimental parallel path also exists for Twilio bidirectional Media Streams
 4. The backend receives `connected`, `start`, `media`, `mark`, and `stop` messages over that socket.
 5. Media frames are buffered in memory for future STT, LLM, and TTS integration.
 
+An experimental parallel path also exists for Twilio ConversationRelay:
+
+1. Twilio sends an HTTP request to `POST /voice-relay`.
+2. The backend responds with TwiML containing `<Connect><ConversationRelay>`.
+3. Twilio opens one WebSocket to `/ws/conversation-relay`.
+4. ConversationRelay sends structured `setup` and `prompt` messages instead of raw audio frames.
+5. The backend sends text-token responses back over the WebSocket for Twilio-managed speech synthesis.
+
+An experimental parallel path also exists for a full-duplex Media Streams skeleton:
+
+1. Twilio sends an HTTP request to `POST /voice-duplex`.
+2. The backend responds with TwiML containing `<Connect><Stream url="wss://.../ws/voice-duplex">`.
+3. Twilio opens one bidirectional WebSocket to `/ws/voice-duplex`.
+4. The backend splits handling into async runtime stages connected by queues.
+5. While outbound speech is in progress, inbound caller audio can trigger a barge-in clear message and return the session to listening.
+
+An experimental parallel path also exists for OpenAI Realtime:
+
+1. Twilio sends an HTTP request to `POST /voice-realtime`.
+2. The backend responds with TwiML containing `<Connect><Stream url="wss://.../ws/openai-realtime">`.
+3. Twilio opens one bidirectional WebSocket to `/ws/openai-realtime`.
+4. The backend opens a second WebSocket to OpenAI Realtime.
+5. Twilio inbound audio is forwarded to Realtime input audio, and Realtime output audio deltas are forwarded back to Twilio as media frames.
+
 ### ngrok for Local Development
 
 Twilio cannot reach `localhost` directly. During local development:
@@ -93,6 +120,24 @@ Key modules:
   Twilio mu-law decode, PCM conversion, 8kHz-to-16kHz upsampling, WAV wrapping, and OpenAI-backed STT boundary.
 - `backend/app/streaming/tts_adapter.py`
   Streaming TTS boundary that synthesizes PCM, converts it to Twilio-compatible mono 8kHz mu-law, and returns outbound media payload bytes.
+- `POST /voice-relay` and `/ws/conversation-relay` in `backend/app/main.py`
+  Experimental Twilio ConversationRelay proof-of-concept path that reuses the existing receptionist business lookup, session state, appointment persistence, calendar booking, and call logging logic while leaving `/voice` and `/voice-stream` separate.
+- `backend/app/duplex/routes.py`
+  Experimental `POST /voice-duplex` route and `/ws/voice-duplex` WebSocket endpoint.
+- `backend/app/duplex/runtime.py`
+  Full-duplex runtime skeleton with inbound receiver, STT worker, agent worker, TTS sender, interruption handler, and queue boundaries.
+- `backend/app/duplex/session.py`
+  In-memory duplex session state, queues, transition history, and Twilio outbound message builders.
+- `backend/app/duplex/stt.py` and `backend/app/duplex/tts.py`
+  Pluggable streaming STT/TTS provider protocols plus current stub providers.
+- `backend/app/realtime/routes.py`
+  Experimental `POST /voice-realtime` route and `/ws/openai-realtime` WebSocket endpoint.
+- `backend/app/realtime/bridge.py`
+  Twilio Media Streams to OpenAI Realtime WebSocket bridge, including session setup, audio forwarding, audio delta forwarding, barge-in clear/cancel handling, and tool-call output boundaries.
+- `backend/app/realtime/session.py`
+  In-memory Realtime bridge session metadata and Twilio message builders.
+- `backend/app/realtime/tools.py`
+  Realtime tool definitions and stub handlers for business lookup, availability, booking, callback capture, and call summary logging.
 - `backend/app/models.py`
   SQLAlchemy ORM models.
 - `backend/app/db.py`
@@ -128,6 +173,56 @@ The streaming path is intentionally isolated from the main receptionist flow.
 - TTS exceptions are logged and do not terminate the WebSocket session
 - the existing `POST /voice` path remains the primary production path for booking, calendar, and current receptionist behavior
 - this streaming path is the future direction for lower-latency voice once STT, LLM, and TTS adapters are plugged in
+
+### Experimental ConversationRelay Path
+
+The ConversationRelay path is intentionally isolated from both the main receptionist flow and the custom Media Streams experiment.
+
+- `POST /voice-relay` returns a safe TwiML error and hangs up unless `ENABLE_CONVERSATION_RELAY_EXPERIMENT=true`
+- when enabled, `POST /voice-relay` returns TwiML with `<Connect><ConversationRelay url="wss://.../ws/conversation-relay">`
+- the relay route uses the same business lookup fallback as `/voice` to choose the initial `welcomeGreeting`
+- `/ws/conversation-relay` accepts ConversationRelay WebSocket events
+- the WebSocket records `setup` as relay session start and stores the configured greeting in the existing `call_sessions` transcript
+- final `prompt` messages are treated as caller transcripts and are passed through the same `detect_and_respond()`-driven state flow used by the main voice route
+- relay responses are shaped after slot merging so booking prompts stay short and natural without changing the production `/voice` response text
+- completed booking and callback intents persist `appointment_requests`, `call_logs`, and `call_sessions` just like the main `/voice` path
+- when Google Calendar booking is enabled, the relay path uses the same availability check and event creation helpers as `/voice`
+- relay logs use the `[conversation-relay]` prefix and record session start, user transcript, assistant response, tool/state transitions, relay errors, and session end
+- `/voice`, `/voice-stream`, and `/ws/media-stream` remain separate endpoints and do not route through this proof-of-concept path
+
+### Experimental Full-Duplex Path
+
+The full-duplex path is intentionally isolated from `/voice`, `/voice-stream`, and `/voice-relay`.
+
+- `POST /voice-duplex` returns TwiML with `<Connect><Stream>` pointing at `/ws/voice-duplex`
+- `/ws/voice-duplex` accepts Twilio Media Streams `connected`, `start`, `media`, and `stop` messages
+- the runtime creates separate async flows for inbound audio receiving, STT, agent responses, TTS sending, and interruption handling
+- `asyncio.Queue` boundaries isolate audio frames, transcripts, agent responses, outbound Twilio messages, and interruption events
+- session state is tracked as `IDLE`, `LISTENING`, `THINKING`, `SPEAKING`, and `INTERRUPTED`
+- the barge-in skeleton keeps monitoring inbound audio energy while the session is `SPEAKING`; if caller speech is detected, the runtime cancels the active TTS task, sends Twilio `{"event":"clear","streamSid":"..."}`, and transitions back to `LISTENING`
+- `StreamingSTTProvider` and `StreamingTTSProvider` are protocol-style interfaces intended for later Deepgram, OpenAI Realtime, ElevenLabs, or similar adapters
+- current STT and TTS providers are stubs, so this path proves architecture and task coordination but does not yet provide production transcription or speech synthesis
+- this path does not write new SQLite tables and does not alter the existing persistence model
+
+### Experimental OpenAI Realtime Path
+
+The OpenAI Realtime path is intentionally isolated from `/voice`, `/voice-stream`, `/voice-relay`, and the `/voice-duplex` skeleton.
+
+- `POST /voice-realtime` returns a safe TwiML error and hangs up unless `ENABLE_OPENAI_REALTIME_EXPERIMENT=true`
+- when enabled, `POST /voice-realtime` returns TwiML with `<Connect><Stream>` pointing at `/ws/openai-realtime`
+- `/ws/openai-realtime` accepts Twilio Media Streams `connected`, `start`, `media`, and `stop` messages
+- the bridge opens an outbound WebSocket to the current OpenAI Realtime endpoint using `OPENAI_REALTIME_MODEL`, `OPENAI_REALTIME_VOICE`, and `OPENAI_API_KEY`; the default Realtime voice is `marin`
+- the bridge authenticates with `Authorization` only and does not send the deprecated `OpenAI-Beta` header
+- the bridge sends a GA-shaped Realtime `session.update` with conversational dental receptionist instructions, nested `audio/pcmu` input/output settings for Twilio-compatible G.711 mu-law, input transcription using `STREAMING_STT_MODEL`, server-side VAD configuration, and tool definitions
+- inbound Twilio `media.payload` audio is forwarded as Realtime `input_audio_buffer.append`
+- automatic VAD response creation is disabled; confirmed transcript events are the explicit user-input boundary for `response.create`
+- Realtime output audio delta events are requested as `audio/pcmu` and forwarded directly back to Twilio as `media` messages with the same stream SID
+- the Realtime prompt is intentionally more conversational than a scripted IVR: it asks for date and time together, avoids repeated greetings, and keeps most responses short
+- barge-in cancellation is disabled by default with `ENABLE_REALTIME_BARGE_IN=false`; when explicitly enabled, the current skeleton can send Twilio `clear`, then send Realtime cancel/clear events
+- tool-call boundaries exist for `lookup_business`, `check_availability`, `create_booking`, `capture_callback`, and `log_call_summary`
+- current tool handlers are stubs; later patches can wire them to existing business lookup, calendar, appointment persistence, callback capture, and call logging logic
+- protocol-sensitive Realtime event shapes are isolated in `backend/app/realtime/bridge.py`
+- this path does not add SQLite tables and makes no production-readiness claim
 
 ### SQLite Persistence Layer
 

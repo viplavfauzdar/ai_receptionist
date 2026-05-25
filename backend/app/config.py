@@ -11,6 +11,15 @@ class Settings(BaseSettings):
     enable_streaming_voice_experiment: bool = False
     streaming_ws_path: str = "/ws/media-stream"
     streaming_voice_route: str = "/voice-stream"
+    enable_conversation_relay_experiment: bool = False
+    conversation_relay_route: str = "/voice-relay"
+    enable_openai_realtime_experiment: bool = False
+    openai_realtime_route: str = "/voice-realtime"
+    openai_realtime_ws_path: str = "/ws/openai-realtime"
+    openai_realtime_model: str = "gpt-realtime"
+    openai_realtime_voice: str = "marin"
+    enable_realtime_barge_in: bool = False
+    realtime_turn_detection_type: str = "semantic_vad"
     max_call_turns: int = 12
     max_llm_calls_per_session: int = 6
     enable_basic_rate_limiting: bool = True

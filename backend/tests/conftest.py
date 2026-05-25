@@ -27,6 +27,14 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         "enable_streaming_voice_experiment": ai_module.settings.enable_streaming_voice_experiment,
         "streaming_ws_path": ai_module.settings.streaming_ws_path,
         "streaming_voice_route": ai_module.settings.streaming_voice_route,
+        "enable_conversation_relay_experiment": ai_module.settings.enable_conversation_relay_experiment,
+        "conversation_relay_route": ai_module.settings.conversation_relay_route,
+        "enable_openai_realtime_experiment": ai_module.settings.enable_openai_realtime_experiment,
+        "openai_realtime_route": ai_module.settings.openai_realtime_route,
+        "openai_realtime_ws_path": ai_module.settings.openai_realtime_ws_path,
+        "openai_realtime_model": ai_module.settings.openai_realtime_model,
+        "openai_realtime_voice": ai_module.settings.openai_realtime_voice,
+        "enable_realtime_barge_in": ai_module.settings.enable_realtime_barge_in,
         "max_call_turns": ai_module.settings.max_call_turns,
         "max_llm_calls_per_session": ai_module.settings.max_llm_calls_per_session,
         "enable_basic_rate_limiting": ai_module.settings.enable_basic_rate_limiting,
@@ -47,6 +55,14 @@ def env_overrides(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     monkeypatch.setattr(ai_module.settings, "enable_streaming_voice_experiment", False)
     monkeypatch.setattr(ai_module.settings, "streaming_ws_path", "/ws/media-stream")
     monkeypatch.setattr(ai_module.settings, "streaming_voice_route", "/voice-stream")
+    monkeypatch.setattr(ai_module.settings, "enable_conversation_relay_experiment", False)
+    monkeypatch.setattr(ai_module.settings, "conversation_relay_route", "/voice-relay")
+    monkeypatch.setattr(ai_module.settings, "enable_openai_realtime_experiment", False)
+    monkeypatch.setattr(ai_module.settings, "openai_realtime_route", "/voice-realtime")
+    monkeypatch.setattr(ai_module.settings, "openai_realtime_ws_path", "/ws/openai-realtime")
+    monkeypatch.setattr(ai_module.settings, "openai_realtime_model", "gpt-realtime")
+    monkeypatch.setattr(ai_module.settings, "openai_realtime_voice", "marin")
+    monkeypatch.setattr(ai_module.settings, "enable_realtime_barge_in", False)
     monkeypatch.setattr(ai_module.settings, "max_call_turns", 12)
     monkeypatch.setattr(ai_module.settings, "max_llm_calls_per_session", 6)
     monkeypatch.setattr(ai_module.settings, "enable_basic_rate_limiting", True)
