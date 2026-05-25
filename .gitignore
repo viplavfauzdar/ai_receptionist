@@ -20,5 +20,7 @@ frontend/.env.local
 .claude/
 .coverage
 *.db
+*.db-journal
 receptionist.db
+receptionist.db-journal
 receptionist.db*

@@ -5,12 +5,49 @@ import xml.etree.ElementTree as ET
 
 from app.config import Settings, settings
 from app.realtime import routes as realtime_routes
-from app.realtime.bridge import OpenAIRealtimeBridge, build_realtime_receptionist_instructions
+from app.realtime.bridge import OpenAIRealtimeBridge, _should_end_call, build_realtime_receptionist_instructions
 from app.realtime.session import RealtimeBridgeSession
 
 
 def _parse_xml(text: str) -> ET.Element:
     return ET.fromstring(text)
+
+
+def test_realtime_should_end_call_for_clear_closing_phrase():
+    assert _should_end_call({"type": "response.done", "text": "Thanks for calling. Goodbye."}) is True
+    assert _should_end_call({"type": "response.done", "text": "Have a great day."}) is True
+
+
+def test_realtime_should_end_call_false_for_normal_booking_prompt():
+    assert _should_end_call({"type": "response.done", "text": "Sure — what day and time works best?"}) is False
+    assert _should_end_call({"type": "response.done", "text": "What is the best callback number?"}) is False
+    assert _should_end_call({"type": "response.done", "text": "Could you repeat that?"}) is False
+
+
+def test_realtime_should_not_end_call_for_greeting_with_thanks_for_calling():
+    greeting = "Hello, thanks for calling Bright Smile Dental. How can I help you today?"
+
+    assert _should_end_call({"type": "response.done", "text": greeting}) is False
+
+
+def test_realtime_should_end_call_parses_nested_response_transcript():
+    event = {
+        "type": "response.done",
+        "response": {
+            "output": [
+                {
+                    "content": [
+                        {
+                            "type": "output_audio",
+                            "transcript": "You're all set. The office will follow up shortly.",
+                        }
+                    ]
+                }
+            ]
+        },
+    }
+
+    assert _should_end_call(event) is True
 
 
 def test_voice_realtime_disabled_returns_safe_twilml_error(client, monkeypatch):

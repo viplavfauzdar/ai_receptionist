@@ -40,11 +40,15 @@ The backend does not connect to ngrok directly. `ngrok` is a separate local proc
 ```mermaid
 flowchart LR
     Caller[Phone Caller] --> Twilio[Twilio Voice]
-    Twilio -->|HTTP POST /voice| Ngrok[ngrok public URL]
+    Twilio -->|HTTP POST /voice or /voice-realtime| Ngrok[ngrok public URL]
     Ngrok -->|Tunnel to localhost:8000| FastAPI[FastAPI backend]
     FastAPI --> AI[OpenAI or fallback reply logic]
     FastAPI --> DB[(SQLite)]
+    FastAPI -->|Completed booking| Calendar{Calendar target}
+    Calendar -->|Business OAuth token + selected calendar| GoogleCalendar[Google Calendar API]
+    Calendar -->|Fallback token.json + GOOGLE_CALENDAR_ID| GoogleCalendar
     FastAPI -->|TwiML XML with <Say> and <Gather>| Ngrok
+    FastAPI -->|Realtime stream audio| OpenAIRealtime[OpenAI Realtime]
     Ngrok --> Twilio
     Twilio -->|Text-to-speech playback| Caller
 ```
@@ -57,6 +61,7 @@ Runtime responsibilities:
 - SQLite stores businesses, call logs, appointment requests, and call sessions.
 - OpenAI generates the receptionist response when `OPENAI_API_KEY` is configured; otherwise the app uses fallback logic.
 - `/voice` validates the Twilio signature by default before processing the webhook.
+- Google Calendar booking targets the connected business calendar first. If a business has not completed Google OAuth onboarding, the backend falls back to the local `token.json` account and `GOOGLE_CALENDAR_ID`, which defaults to `primary`.
 
 Code locations:
 - Twilio webhook and TwiML generation: [`backend/app/main.py`](backend/app/main.py)
@@ -104,6 +109,7 @@ OPENAI_REALTIME_WS_PATH=/ws/openai-realtime
 OPENAI_REALTIME_MODEL=gpt-realtime
 OPENAI_REALTIME_VOICE=marin
 ENABLE_REALTIME_BARGE_IN=false
+REALTIME_TURN_DETECTION_TYPE=semantic_vad
 STREAMING_STT_BUFFER_BYTES=32000
 MAX_CALL_TURNS=12
 MAX_LLM_CALLS_PER_SESSION=6
@@ -157,8 +163,8 @@ Behavior:
 - If Twilio sends a malformed `/voice` webhook without required identifiers such as `CallSid` or `From`, the backend returns a short TwiML apology and ends the call instead of crashing.
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
 - When Google Calendar is enabled and a booking is complete, the backend creates a real calendar event and confirms it to the caller. If calendar creation fails, the request is still saved and the caller gets a fallback confirmation.
-- Google Calendar onboarding is now business-linked: a business can connect its own Google account through backend OAuth routes, store its token on the business row, list available calendars, and select which calendar receives bookings.
-- The business-linked token and selected calendar are now the preferred runtime path for booking. The older single `token.json` bootstrap still works as a local fallback when a business has not connected its own calendar yet.
+- Google Calendar onboarding is business-linked: a business can connect its own Google account through backend OAuth routes, store its token on the business row, list available calendars, and select which calendar receives bookings.
+- Calendar selection order is business first, fallback second. The runtime uses `business.google_token_json` plus `business.google_calendar_id` when present; otherwise it uses the legacy local `GOOGLE_TOKEN_FILE` account with `GOOGLE_CALENDAR_ID=primary` by default.
 - Before creating the Google Calendar event, the backend checks the requested window for conflicts. If the slot overlaps an existing active event, the backend does not create the event and asks the caller for another time.
 - When the calendar service can infer a nearby opening after the conflicting event chain, the receptionist offers that suggested slot in the spoken response.
 
@@ -205,6 +211,7 @@ Backend `.env`:
 - `OPENAI_REALTIME_MODEL=gpt-realtime`
 - `OPENAI_REALTIME_VOICE=marin`
 - `ENABLE_REALTIME_BARGE_IN=false`
+- `REALTIME_TURN_DETECTION_TYPE=semantic_vad`
 - `STREAMING_STT_BUFFER_BYTES=32000`
 - `MAX_CALL_TURNS=12`
 - `MAX_LLM_CALLS_PER_SESSION=6`
@@ -366,15 +373,27 @@ This is an isolated proof-of-concept bridge from Twilio Media Streams to OpenAI 
 - Enable with `ENABLE_OPENAI_REALTIME_EXPERIMENT=true`
 - Configure with `OPENAI_REALTIME_ROUTE=/voice-realtime` and `OPENAI_REALTIME_WS_PATH=/ws/openai-realtime`
 - Realtime model and voice come from `OPENAI_REALTIME_MODEL` and `OPENAI_REALTIME_VOICE`; the default Realtime voice is `marin`
+- Realtime turn detection defaults to `REALTIME_TURN_DETECTION_TYPE=semantic_vad`
 - TwiML uses `<Connect><Stream>` and points Twilio to `wss://YOUR-NGROK-HOST/ws/openai-realtime`
 - the bridge connects to the current OpenAI Realtime WebSocket endpoint with `Authorization` only, sends a GA-shaped `session.update` using nested `audio.input.format.type` and `audio.output.format.type` set to `audio/pcmu`, enables input audio transcription with `STREAMING_STT_MODEL`, forwards Twilio inbound G.711 mu-law audio as Realtime input audio, and directly forwards Realtime `audio/pcmu` deltas back to Twilio as `media`
-- automatic VAD response creation is disabled; after the initial greeting, confirmed transcript events trigger explicit `response.create` calls
+- Realtime uses model-managed turn taking with `semantic_vad` and `create_response=true`; OpenAI detects end-of-turn and creates responses without the bridge waiting for `transcription.completed`
+- this avoids silence caused by unreliable transcript-gated response creation and feels more conversational than IVR-style manual turn handling
+- final audio flow: Twilio `audio/pcmu` payload -> OpenAI `input_audio_buffer.append` -> OpenAI Realtime `semantic_vad` -> automatic model response -> OpenAI `audio/pcmu` delta -> Twilio `media.payload` direct forward
+- direct audio forwarding is required: do not decode or re-encode OpenAI audio deltas, do not resample, and do not convert PCM; `audio/pcmu` deltas go directly to Twilio `media.payload`
 - Realtime tool-call boundaries exist for `lookup_business`, `check_availability`, `create_booking`, `capture_callback`, and `log_call_summary`
 - Realtime instructions are conversational rather than scripted IVR: short front-desk replies, date and time together for booking, minimal repeated confirmations, and no repeated greeting after the first turn
 - current tool handlers are stubs; they are structured so later patches can call existing business lookup, calendar, booking, callback, and call-log logic
-- barge-in cancellation is disabled by default with `ENABLE_REALTIME_BARGE_IN=false`; when explicitly enabled, the current skeleton sends Twilio `clear`, then sends Realtime cancel/clear events
+- barge-in cancellation is disabled by default with `ENABLE_REALTIME_BARGE_IN=false`; when enabled, barge-in is based on OpenAI `input_audio_buffer.speech_started` events, never raw Twilio media frames
+- repeated cancellations usually mean barge-in is being triggered from the wrong signal; raw Twilio media frames arrive continuously and include silence/noise
 - protocol-sensitive Realtime message shapes are isolated in `backend/app/realtime/bridge.py`; the bridge does not send the deprecated `OpenAI-Beta` header
 - this path makes no production claim and does not change `/voice`, `/voice-stream`, `/voice-relay`, or `/voice-duplex`
+
+Troubleshooting:
+
+- Static usually means an audio format mismatch. Twilio expects G.711 mu-law, so Realtime input/output should be `audio/pcmu` and output deltas should be forwarded unchanged.
+- Silence after the greeting usually means response creation or turn gating is wrong. The working path uses `semantic_vad` with `create_response=true`.
+- Rambling usually means VAD auto-response is firing too aggressively or the prompt is over-eager. Tune turn detection and keep the receptionist instructions explicit about waiting for the caller.
+- Repeated cancellations usually mean bad barge-in logic. Barge-in should come from OpenAI `input_audio_buffer.speech_started`, not raw Twilio `media` frames.
 
 Required backend env vars:
 
@@ -385,6 +404,7 @@ OPENAI_REALTIME_WS_PATH=/ws/openai-realtime
 OPENAI_REALTIME_MODEL=gpt-realtime
 OPENAI_REALTIME_VOICE=marin
 ENABLE_REALTIME_BARGE_IN=false
+REALTIME_TURN_DETECTION_TYPE=semantic_vad
 OPENAI_API_KEY=your_real_openai_api_key
 ```
 

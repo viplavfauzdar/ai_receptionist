@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
@@ -13,6 +14,15 @@ from .session import RealtimeBridgeSession
 from .tools import REALTIME_TOOL_DEFINITIONS, REALTIME_TOOL_HANDLERS
 
 REALTIME_TWILIO_AUDIO_FORMAT = {"type": "audio/pcmu"}
+END_CALL_PHRASES = (
+    "goodbye",
+    "bye",
+    "have a good day",
+    "have a great day",
+    "the office will follow up",
+    "we'll follow up",
+    "we will follow up",
+)
 
 
 class RealtimeSocket(Protocol):
@@ -31,6 +41,35 @@ RealtimeConnector = Callable[[], Awaitable[RealtimeSocket]]
 
 def _log_realtime(message: str) -> None:
     print(f"[openai-realtime] {message}", flush=True)
+
+
+def _iter_text_values(value: Any):
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_text_values(nested)
+        return
+    if isinstance(value, list):
+        for nested in value:
+            yield from _iter_text_values(nested)
+
+
+def _should_end_call(event: dict[str, Any]) -> bool:
+    text = " ".join(_iter_text_values(event)).lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return False
+
+    for phrase in END_CALL_PHRASES:
+        if phrase == "bye":
+            if re.search(r"\bbye\b", text):
+                return True
+            continue
+        if phrase in text:
+            return True
+    return False
 
 
 def build_realtime_receptionist_instructions() -> str:
@@ -360,6 +399,14 @@ class OpenAIRealtimeBridge:
                     _log_realtime(f"event=response_active value=false stream_sid={session.stream_sid} reason={event_type}")
                 session.openai_response_active = False
                 session.record_event(event_type)
+                if _should_end_call(event):
+                    _log_realtime(f"event=end_call_requested stream_sid={session.stream_sid} reason=response_done")
+                    stop_event.set()
+                    try:
+                        await twilio_websocket.close(code=1000)
+                    except Exception:
+                        pass
+                    return
                 continue
 
             if event_type == "input_audio_buffer.speech_started":

@@ -52,6 +52,39 @@ The backend is therefore a webhook-driven state machine.
 
 The current primary path remains `POST /voice`.
 
+Current high-level runtime flow:
+
+```mermaid
+flowchart TD
+    Caller[Phone caller] --> Twilio[Twilio Voice]
+    Twilio -->|POST /voice| VoiceRoute[FastAPI /voice]
+    Twilio -->|POST /voice-realtime| RealtimeRoute[FastAPI /voice-realtime]
+
+    VoiceRoute --> BusinessLookup[Business lookup by Twilio To number]
+    BusinessLookup --> SessionState[Call session state in SQLite]
+    SessionState --> Receptionist[detect_and_respond or fallback rules]
+    Receptionist --> VoiceTwiML[TwiML Say + Gather]
+    VoiceTwiML --> Twilio
+
+    RealtimeRoute --> RealtimeTwiML[TwiML Connect Stream]
+    RealtimeTwiML --> TwilioWS[Twilio Media Stream]
+    TwilioWS -->|audio/pcmu media.payload| RealtimeBridge[/ws/openai-realtime bridge]
+    RealtimeBridge -->|input_audio_buffer.append| OpenAIRealtime[OpenAI Realtime semantic_vad]
+    OpenAIRealtime -->|audio/pcmu delta| RealtimeBridge
+    RealtimeBridge -->|media.payload direct forward| TwilioWS
+
+    Receptionist -->|completed booking| Appointment[(appointment_requests)]
+    Appointment --> CalendarTarget{Calendar target}
+    CalendarTarget -->|business.google_token_json + business.google_calendar_id| BusinessCalendar[Business-selected Google Calendar]
+    CalendarTarget -->|fallback GOOGLE_TOKEN_FILE + GOOGLE_CALENDAR_ID| FallbackCalendar[Local fallback Google Calendar]
+    BusinessCalendar --> GoogleAPI[Google Calendar API v3]
+    FallbackCalendar --> GoogleAPI
+
+    RealtimeBridge --> RealtimeTools[Realtime tool-call boundaries]
+    RealtimeTools -. future wiring .-> BusinessLookup
+    VoiceRoute --> CallLogs[(call_logs)]
+```
+
 An experimental parallel path also exists for Twilio bidirectional Media Streams:
 
 1. Twilio sends an HTTP request to `POST /voice-stream`.
@@ -213,16 +246,25 @@ The OpenAI Realtime path is intentionally isolated from `/voice`, `/voice-stream
 - `/ws/openai-realtime` accepts Twilio Media Streams `connected`, `start`, `media`, and `stop` messages
 - the bridge opens an outbound WebSocket to the current OpenAI Realtime endpoint using `OPENAI_REALTIME_MODEL`, `OPENAI_REALTIME_VOICE`, and `OPENAI_API_KEY`; the default Realtime voice is `marin`
 - the bridge authenticates with `Authorization` only and does not send the deprecated `OpenAI-Beta` header
-- the bridge sends a GA-shaped Realtime `session.update` with conversational dental receptionist instructions, nested `audio/pcmu` input/output settings for Twilio-compatible G.711 mu-law, input transcription using `STREAMING_STT_MODEL`, server-side VAD configuration, and tool definitions
+- the bridge sends a GA-shaped Realtime `session.update` with conversational dental receptionist instructions, nested `audio/pcmu` input/output settings for Twilio-compatible G.711 mu-law, input transcription using `STREAMING_STT_MODEL`, `REALTIME_TURN_DETECTION_TYPE=semantic_vad` by default, and tool definitions
 - inbound Twilio `media.payload` audio is forwarded as Realtime `input_audio_buffer.append`
-- automatic VAD response creation is disabled; confirmed transcript events are the explicit user-input boundary for `response.create`
-- Realtime output audio delta events are requested as `audio/pcmu` and forwarded directly back to Twilio as `media` messages with the same stream SID
+- OpenAI Realtime owns end-of-turn detection with `semantic_vad` and `create_response=true`; the bridge does not wait for `transcription.completed` and does not manually send `response.create` after every transcript
+- this model-managed turn taking avoids silence from unreliable transcript-gated response creation and feels more conversational than IVR-style manual turn handling
+- final audio flow is Twilio `audio/pcmu` payload -> OpenAI `input_audio_buffer.append` -> OpenAI Realtime `semantic_vad` -> automatic model response -> OpenAI `audio/pcmu` delta -> Twilio `media.payload` direct forward
+- Realtime output audio delta events are requested as `audio/pcmu` and forwarded directly back to Twilio as `media` messages with the same stream SID; do not decode/re-encode, resample, or convert PCM on this path
 - the Realtime prompt is intentionally more conversational than a scripted IVR: it asks for date and time together, avoids repeated greetings, and keeps most responses short
-- barge-in cancellation is disabled by default with `ENABLE_REALTIME_BARGE_IN=false`; when explicitly enabled, the current skeleton can send Twilio `clear`, then send Realtime cancel/clear events
+- barge-in cancellation is disabled by default with `ENABLE_REALTIME_BARGE_IN=false`; when enabled, barge-in is based on OpenAI `input_audio_buffer.speech_started` events, not raw Twilio media frames
 - tool-call boundaries exist for `lookup_business`, `check_availability`, `create_booking`, `capture_callback`, and `log_call_summary`
 - current tool handlers are stubs; later patches can wire them to existing business lookup, calendar, appointment persistence, callback capture, and call logging logic
 - protocol-sensitive Realtime event shapes are isolated in `backend/app/realtime/bridge.py`
 - this path does not add SQLite tables and makes no production-readiness claim
+
+Troubleshooting notes for the Realtime path:
+
+- Static usually means an audio format mismatch. Twilio media expects G.711 mu-law, so the Realtime session should use `audio/pcmu` and output deltas should be forwarded unchanged.
+- Silence after the greeting usually means response creation or turn gating is wrong. The working strategy is `semantic_vad` with `create_response=true`.
+- Rambling usually means VAD auto-response is firing too aggressively or the prompt is over-eager.
+- Repeated cancellations usually mean bad barge-in logic. Do not cancel from raw Twilio media frames because those frames arrive continuously, including silence and noise.
 
 ### SQLite Persistence Layer
 
@@ -274,6 +316,12 @@ The preferred path is now per-business OAuth onboarding:
 - each `businesses` row can store its own Google token JSON
 - each business can select its own destination calendar ID
 - booking and conflict checks prefer the business-linked token and selected calendar at runtime
+
+The exact calendar selection order is:
+
+1. Use `business.google_token_json` plus `business.google_calendar_id` when the matched business has completed Google OAuth onboarding and selected a calendar.
+2. If the business has no connected calendar, use the legacy local token from `GOOGLE_TOKEN_FILE`.
+3. If no explicit calendar ID is passed to the service, use `GOOGLE_CALENDAR_ID`, which defaults to `primary`.
 
 The legacy `token.json` file flow still exists as a local fallback for businesses that have not completed onboarding yet.
 
