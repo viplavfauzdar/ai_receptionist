@@ -24,3 +24,5 @@ frontend/.env.local
 receptionist.db
 receptionist.db-journal
 receptionist.db*
+
+credentials.json

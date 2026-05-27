@@ -254,8 +254,12 @@ The OpenAI Realtime path is intentionally isolated from `/voice`, `/voice-stream
 - Realtime output audio delta events are requested as `audio/pcmu` and forwarded directly back to Twilio as `media` messages with the same stream SID; do not decode/re-encode, resample, or convert PCM on this path
 - the Realtime prompt is intentionally more conversational than a scripted IVR: it asks for date and time together, avoids repeated greetings, and keeps most responses short
 - barge-in cancellation is disabled by default with `ENABLE_REALTIME_BARGE_IN=false`; when enabled, barge-in is based on OpenAI `input_audio_buffer.speech_started` events, not raw Twilio media frames
-- tool-call boundaries exist for `lookup_business`, `check_availability`, `create_booking`, `capture_callback`, and `log_call_summary`
-- current tool handlers are stubs; later patches can wire them to existing business lookup, calendar, appointment persistence, callback capture, and call logging logic
+- tool-call boundaries exist for `lookup_business`, `check_availability`, `book_appointment`, `create_booking`, `capture_callback`, and `log_call_summary`
+- `book_appointment` is the minimal wired Realtime booking tool: after the model collects appointment day, time, caller name, and callback number, the tool persists an `appointment_requests` row and, when Google Calendar is enabled, uses the existing calendar service to check availability and create the event on the matched business calendar
+- Realtime appointment creation is idempotent per `call_sid`, caller phone, and requested time; duplicate tool calls reuse the existing appointment row and do not create another Google Calendar event
+- Realtime start/end, user transcripts, assistant summaries, tool calls, and appointment creation outcomes are logged through the existing `call_sessions` and `call_logs` tables
+- `create_booking` remains as a legacy alias for `book_appointment`
+- the remaining Realtime tool handlers are still stubs; later patches can wire them to existing business lookup, callback capture, and call logging logic
 - protocol-sensitive Realtime event shapes are isolated in `backend/app/realtime/bridge.py`
 - this path does not add SQLite tables and makes no production-readiness claim
 
