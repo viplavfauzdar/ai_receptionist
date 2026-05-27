@@ -1,12 +1,17 @@
 import asyncio
 from base64 import b64encode
+from datetime import datetime
 import json
 import xml.etree.ElementTree as ET
 
+from app.calendar_service import CalendarAvailabilityResult, CalendarBookingResult
 from app.config import Settings, settings
+from app.models import AppointmentRequest, Business, CallLog, CallSession
 from app.realtime import routes as realtime_routes
 from app.realtime.bridge import OpenAIRealtimeBridge, _should_end_call, build_realtime_receptionist_instructions
 from app.realtime.session import RealtimeBridgeSession
+from app.realtime.tools import book_appointment
+import app.realtime.tools as realtime_tools
 
 
 def _parse_xml(text: str) -> ET.Element:
@@ -96,6 +101,7 @@ def test_realtime_session_update_uses_configured_model_voice_and_tools(monkeypat
     assert {
         "lookup_business",
         "check_availability",
+        "book_appointment",
         "create_booking",
         "capture_callback",
         "log_call_summary",
@@ -210,6 +216,7 @@ def test_realtime_session_update_includes_conversational_instructions():
     assert "Do not repeat the greeting" in instructions
     assert "Do not assume the caller wants an appointment" in instructions
     assert "Ask for date and time together" in instructions
+    assert "book_appointment" in instructions
 
 
 def test_realtime_session_audio_config_uses_current_pcmu_format(monkeypatch):
@@ -759,6 +766,393 @@ def test_realtime_response_done_clears_active_state(client, monkeypatch):
     sent_types = [message["type"] for message in fake_socket.sent]
     assert "input_audio_buffer.append" in sent_types
     assert "response.cancel" not in sent_types
+
+
+def test_realtime_booking_tool_creates_appointment_request_and_calendar_event(db_session, monkeypatch):
+    monkeypatch.setattr(realtime_tools, "SessionLocal", db_session)
+    monkeypatch.setattr(settings, "google_calendar_enabled", True)
+    monkeypatch.setattr(settings, "google_timezone", "America/New_York")
+    monkeypatch.setattr(settings, "appointment_duration_minutes", 30)
+    captured: dict[str, object] = {}
+
+    db = db_session()
+    db.add(
+        Business(
+            id=1,
+            name="Bright Smile Dental",
+            twilio_number="+15557654321",
+            twilio_number_normalized="5557654321",
+            google_calendar_connected=True,
+            google_calendar_id="business-calendar@example.com",
+            google_token_json='{"refresh_token":"token"}',
+        )
+    )
+    db.commit()
+    db.close()
+
+    def _fake_check_calendar_availability(**kwargs):
+        captured["availability"] = kwargs
+        return CalendarAvailabilityResult(available=True, conflicting_events=[], suggested_slots=[])
+
+    def _fake_create_calendar_booking(**kwargs):
+        captured["booking"] = kwargs
+        return CalendarBookingResult(
+            event_id="evt_realtime",
+            html_link="https://calendar.google.com/event?eid=evt_realtime",
+            scheduled_start=datetime(2026, 5, 28, 13, 0),
+            scheduled_end=datetime(2026, 5, 28, 13, 30),
+        )
+
+    monkeypatch.setattr(realtime_tools, "check_calendar_availability", _fake_check_calendar_availability)
+    monkeypatch.setattr(realtime_tools, "create_calendar_booking", _fake_create_calendar_booking)
+    monkeypatch.setattr(
+        realtime_tools,
+        "build_appointment_window",
+        lambda **_: (datetime(2026, 5, 28, 13, 0), datetime(2026, 5, 28, 13, 30)),
+    )
+
+    session = RealtimeBridgeSession(
+        stream_sid="MZ-booking",
+        call_sid="CA-booking",
+        from_number="+15551230000",
+        to_number="+15557654321",
+    )
+    result = asyncio.run(
+        book_appointment(
+            session,
+            {
+                "caller_name": "Alex Morgan",
+                "callback_number": "+15551230000",
+                "appointment_day": "Thursday",
+                "appointment_time": "1 PM",
+            },
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["calendar_status"] == "created"
+    assert result["calendar_event_id"] == "evt_realtime"
+    assert captured["availability"]["calendar_id"] == "business-calendar@example.com"
+    assert captured["availability"]["token_json"] == '{"refresh_token":"token"}'
+    assert captured["booking"]["calendar_id"] == "business-calendar@example.com"
+    assert captured["booking"]["token_json"] == '{"refresh_token":"token"}'
+
+    db = db_session()
+    appointment = db.query(AppointmentRequest).one()
+    db.close()
+    assert appointment.business_id == 1
+    assert appointment.caller_name == "Alex Morgan"
+    assert appointment.caller_phone == "+15551230000"
+    assert appointment.requested_time == "Thursday 1 PM"
+    assert appointment.confirmed is True
+    assert appointment.calendar_event_id == "evt_realtime"
+
+
+def test_realtime_booking_tool_uses_selected_business_calendar(db_session, monkeypatch):
+    monkeypatch.setattr(realtime_tools, "SessionLocal", db_session)
+    monkeypatch.setattr(settings, "google_calendar_enabled", True)
+    captured: dict[str, object] = {}
+
+    db = db_session()
+    db.add(
+        Business(
+            id=1,
+            name="Bright Smile Dental",
+            twilio_number="+15557654321",
+            twilio_number_normalized="5557654321",
+            google_calendar_connected=True,
+            google_calendar_id="selected-calendar-id",
+            google_token_json='{"refresh_token":"business-token"}',
+        )
+    )
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(
+        realtime_tools,
+        "build_appointment_window",
+        lambda **_: (datetime(2026, 5, 28, 13, 0), datetime(2026, 5, 28, 13, 30)),
+    )
+    def _fake_selected_check_calendar_availability(**kwargs):
+        captured["availability"] = kwargs
+        return CalendarAvailabilityResult(available=True, conflicting_events=[], suggested_slots=[])
+
+    def _fake_selected_create_calendar_booking(**kwargs):
+        captured["booking"] = kwargs
+        return CalendarBookingResult(
+            event_id="evt_selected",
+            html_link=None,
+            scheduled_start=datetime(2026, 5, 28, 13, 0),
+            scheduled_end=datetime(2026, 5, 28, 13, 30),
+        )
+
+    monkeypatch.setattr(realtime_tools, "check_calendar_availability", _fake_selected_check_calendar_availability)
+    monkeypatch.setattr(realtime_tools, "create_calendar_booking", _fake_selected_create_calendar_booking)
+
+    result = asyncio.run(
+        book_appointment(
+            RealtimeBridgeSession(to_number="+15557654321"),
+            {
+                "caller_name": "Alex Morgan",
+                "callback_number": "+15551230000",
+                "appointment_day": "Thursday",
+                "appointment_time": "1 PM",
+            },
+        )
+    )
+
+    assert result["calendar_status"] == "created"
+    assert captured["availability"]["calendar_id"] == "selected-calendar-id"
+    assert captured["booking"]["calendar_id"] == "selected-calendar-id"
+
+
+def test_realtime_booking_tool_missing_calendar_token_fails_gracefully(db_session, monkeypatch):
+    monkeypatch.setattr(realtime_tools, "SessionLocal", db_session)
+    monkeypatch.setattr(settings, "google_calendar_enabled", True)
+
+    db = db_session()
+    db.add(
+        Business(
+            id=1,
+            name="Bright Smile Dental",
+            twilio_number="+15557654321",
+            twilio_number_normalized="5557654321",
+            google_calendar_connected=True,
+            google_calendar_id="selected-calendar-id",
+            google_token_json=None,
+        )
+    )
+    db.commit()
+    db.close()
+
+    result = asyncio.run(
+        book_appointment(
+            RealtimeBridgeSession(to_number="+15557654321"),
+            {
+                "caller_name": "Alex Morgan",
+                "callback_number": "+15551230000",
+                "appointment_day": "Thursday",
+                "appointment_time": "1 PM",
+            },
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["calendar_status"] == "missing_business_token"
+    assert result["confirmed"] is False
+    assert result["calendar_event_id"] is None
+
+    db = db_session()
+    appointment = db.query(AppointmentRequest).one()
+    db.close()
+    assert appointment.business_id == 1
+    assert appointment.confirmed is False
+    assert appointment.calendar_event_id is None
+
+
+def test_realtime_duplicate_booking_request_reuses_existing_appointment(db_session, monkeypatch):
+    monkeypatch.setattr(realtime_tools, "SessionLocal", db_session)
+    monkeypatch.setattr(settings, "google_calendar_enabled", True)
+    calendar_create_count = 0
+
+    db = db_session()
+    db.add(
+        Business(
+            id=1,
+            name="Bright Smile Dental",
+            twilio_number="+15557654321",
+            twilio_number_normalized="5557654321",
+            google_calendar_connected=True,
+            google_calendar_id="selected-calendar-id",
+            google_token_json='{"refresh_token":"business-token"}',
+        )
+    )
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(
+        realtime_tools,
+        "build_appointment_window",
+        lambda **_: (datetime(2026, 5, 28, 13, 0), datetime(2026, 5, 28, 13, 30)),
+    )
+    monkeypatch.setattr(
+        realtime_tools,
+        "check_calendar_availability",
+        lambda **_: CalendarAvailabilityResult(available=True, conflicting_events=[], suggested_slots=[]),
+    )
+
+    def _fake_create_calendar_booking(**_):
+        nonlocal calendar_create_count
+        calendar_create_count += 1
+        return CalendarBookingResult(
+            event_id=f"evt_{calendar_create_count}",
+            html_link=None,
+            scheduled_start=datetime(2026, 5, 28, 13, 0),
+            scheduled_end=datetime(2026, 5, 28, 13, 30),
+        )
+
+    monkeypatch.setattr(realtime_tools, "create_calendar_booking", _fake_create_calendar_booking)
+    session = RealtimeBridgeSession(call_sid="CA-duplicate", to_number="+15557654321")
+    arguments = {
+        "caller_name": "Alex Morgan",
+        "callback_number": "+15551230000",
+        "appointment_day": "Thursday",
+        "appointment_time": "1 PM",
+    }
+
+    first = asyncio.run(book_appointment(session, arguments))
+    second = asyncio.run(book_appointment(session, arguments))
+
+    assert first["duplicate"] is False
+    assert second["duplicate"] is True
+    assert second["appointment_request_id"] == first["appointment_request_id"]
+    assert calendar_create_count == 1
+
+    db = db_session()
+    appointments = db.query(AppointmentRequest).all()
+    db.close()
+    assert len(appointments) == 1
+
+
+def test_realtime_start_creates_call_session(client, db_session, monkeypatch):
+    monkeypatch.setattr(realtime_tools, "SessionLocal", db_session)
+    monkeypatch.setattr(settings, "enable_openai_realtime_experiment", True)
+    fake_socket = _FakeOpenAISocket()
+    original_bridge = realtime_routes.realtime_bridge
+    realtime_routes.realtime_bridge = OpenAIRealtimeBridge(connector=lambda: _fake_connect(fake_socket))
+
+    db = db_session()
+    db.add(
+        Business(
+            id=1,
+            name="Bright Smile Dental",
+            twilio_number="+15557654321",
+            twilio_number_normalized="5557654321",
+        )
+    )
+    db.commit()
+    db.close()
+
+    try:
+        with client.websocket_connect("/ws/openai-realtime") as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "event": "start",
+                        "start": {
+                            "streamSid": "MZ-session",
+                            "callSid": "CA-session",
+                            "customParameters": {"From": "+15551230000", "To": "+15557654321"},
+                        },
+                    }
+                )
+            )
+            websocket.send_text(json.dumps({"event": "stop", "stop": {"streamSid": "MZ-session"}}))
+    finally:
+        realtime_routes.realtime_bridge = original_bridge
+
+    db = db_session()
+    session_row = db.query(CallSession).filter(CallSession.call_sid == "CA-session").one()
+    logs = db.query(CallLog).filter(CallLog.call_sid == "CA-session").all()
+    db.close()
+
+    assert session_row.from_number == "+15551230000"
+    assert session_row.to_number == "+15557654321"
+    assert session_row.current_intent == "OPENAI_REALTIME"
+    assert session_row.current_state == "ENDED"
+    assert session_row.is_active is False
+    slot_data = json.loads(session_row.slot_data_json)
+    assert slot_data["stream_sid"] == "MZ-session"
+    assert slot_data["business_id"] == 1
+    assert {log.call_status for log in logs}.issuperset({"realtime_call_started", "realtime_call_ended"})
+
+
+def test_realtime_tool_call_creates_call_log_entries(db_session, monkeypatch):
+    monkeypatch.setattr(realtime_tools, "SessionLocal", db_session)
+    monkeypatch.setattr(settings, "google_calendar_enabled", False)
+
+    db = db_session()
+    db.add(
+        Business(
+            id=1,
+            name="Bright Smile Dental",
+            twilio_number="+15557654321",
+            twilio_number_normalized="5557654321",
+        )
+    )
+    db.commit()
+    db.close()
+
+    async def _run():
+        fake_socket = _FakeOpenAISocket()
+        bridge = OpenAIRealtimeBridge(connector=lambda: _fake_connect(fake_socket))
+        session = RealtimeBridgeSession(
+            stream_sid="MZ-tool",
+            call_sid="CA-tool",
+            from_number="+15551230000",
+            to_number="+15557654321",
+        )
+        await bridge._handle_tool_call(
+            fake_socket,
+            asyncio.Lock(),
+            session,
+            {
+                "type": "response.function_call_arguments.done",
+                "name": "book_appointment",
+                "call_id": "call_123",
+                "arguments": json.dumps(
+                    {
+                        "caller_name": "Alex Morgan",
+                        "callback_number": "+15551230000",
+                        "appointment_day": "Thursday",
+                        "appointment_time": "1 PM",
+                    }
+                ),
+            },
+        )
+        return fake_socket
+
+    fake_socket = asyncio.run(_run())
+
+    db = db_session()
+    statuses = {row.call_status for row in db.query(CallLog).filter(CallLog.call_sid == "CA-tool").all()}
+    appointment = db.query(AppointmentRequest).one()
+    db.close()
+
+    assert {"realtime_tool_call_received", "realtime_appointment_create_attempted", "realtime_appointment_created"}.issubset(
+        statuses
+    )
+    assert appointment.requested_time == "Thursday 1 PM"
+    output_items = [message for message in fake_socket.sent if message["type"] == "conversation.item.create"]
+    assert len(output_items) == 1
+    output = json.loads(output_items[0]["item"]["output"])
+    assert output["appointment_request_id"] == appointment.id
+
+
+def test_realtime_duplicate_tool_call_returns_existing_appointment(db_session, monkeypatch):
+    monkeypatch.setattr(realtime_tools, "SessionLocal", db_session)
+    monkeypatch.setattr(settings, "google_calendar_enabled", False)
+
+    arguments = {
+        "caller_name": "Alex Morgan",
+        "callback_number": "+15551230000",
+        "appointment_day": "Thursday",
+        "appointment_time": "1 PM",
+    }
+    session = RealtimeBridgeSession(call_sid="CA-tool-duplicate", to_number="+15557654321")
+
+    first = asyncio.run(book_appointment(session, arguments))
+    second = asyncio.run(book_appointment(session, arguments))
+
+    db = db_session()
+    appointment_count = db.query(AppointmentRequest).count()
+    duplicate_logs = db.query(CallLog).filter(CallLog.call_status == "realtime_appointment_duplicate").count()
+    db.close()
+
+    assert appointment_count == 1
+    assert second["duplicate"] is True
+    assert second["appointment_request_id"] == first["appointment_request_id"]
+    assert duplicate_logs == 1
 
 
 class _FakeTwilioWebSocket:

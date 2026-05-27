@@ -11,7 +11,14 @@ import websockets
 
 from ..config import settings
 from .session import RealtimeBridgeSession
-from .tools import REALTIME_TOOL_DEFINITIONS, REALTIME_TOOL_HANDLERS
+from .tools import (
+    REALTIME_TOOL_DEFINITIONS,
+    REALTIME_TOOL_HANDLERS,
+    persist_realtime_call_end,
+    persist_realtime_call_log,
+    persist_realtime_call_start,
+    persist_realtime_transcript,
+)
 
 REALTIME_TWILIO_AUDIO_FORMAT = {"type": "audio/pcmu"}
 END_CALL_PHRASES = (
@@ -72,6 +79,12 @@ def _should_end_call(event: dict[str, Any]) -> bool:
     return False
 
 
+def _event_text_summary(event: dict[str, Any], *, max_chars: int = 300) -> str:
+    text = " ".join(_iter_text_values(event))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
 def build_realtime_receptionist_instructions() -> str:
     booking_status = "enabled" if settings.booking_enabled else "disabled"
     return "\n".join(
@@ -91,6 +104,7 @@ def build_realtime_receptionist_instructions() -> str:
             "Ask for date and time together when booking.",
             "If the caller says appointment, say: Sure — what day and time works best?",
             "If the caller gives date and time, ask for name and callback number together.",
+            "After collecting date, time, name, and callback number, call the book_appointment tool.",
             "Do not over-confirm every field; save confirmation for the final summary.",
             "Use natural repair prompts: I missed the number. Could you repeat it?",
             "Use natural repair prompts: What day works best? What time works best?",
@@ -243,6 +257,7 @@ class OpenAIRealtimeBridge:
                     await openai_socket.close()
                 except Exception:
                     pass
+            persist_realtime_call_end(session)
             _log_realtime(
                 f"event=cleanup stream_sid={session.stream_sid} "
                 f"twilio_media_chunks={session.twilio_media_chunks} "
@@ -289,6 +304,7 @@ class OpenAIRealtimeBridge:
                 if event_type == "start":
                     session.update_from_start(payload.get("start") or {})
                     _log_realtime(f"event=start stream_sid={session.stream_sid} call_sid={session.call_sid}")
+                    persist_realtime_call_start(session)
                     greeting_response = self.build_initial_greeting_response_create()
                     await self._send_openai(openai_socket, openai_send_lock, greeting_response)
                     _log_realtime(f"event=response_create_sent stream_sid={session.stream_sid} reason=initial_greeting")
@@ -323,6 +339,7 @@ class OpenAIRealtimeBridge:
 
                 if event_type == "stop":
                     session.record_event("stop")
+                    persist_realtime_call_end(session)
                     stop_event.set()
                     return
 
@@ -399,8 +416,10 @@ class OpenAIRealtimeBridge:
                     _log_realtime(f"event=response_active value=false stream_sid={session.stream_sid} reason={event_type}")
                 session.openai_response_active = False
                 session.record_event(event_type)
+                persist_realtime_transcript(session, role="assistant", text=_event_text_summary(event))
                 if _should_end_call(event):
                     _log_realtime(f"event=end_call_requested stream_sid={session.stream_sid} reason=response_done")
+                    persist_realtime_call_end(session)
                     stop_event.set()
                     try:
                         await twilio_websocket.close(code=1000)
@@ -424,6 +443,7 @@ class OpenAIRealtimeBridge:
                     f"event=transcription_completed stream_sid={session.stream_sid} "
                     f"transcript={transcript}"
                 )
+                persist_realtime_transcript(session, role="user", text=transcript)
                 session.record_event(event_type)
                 continue
 
@@ -440,8 +460,13 @@ class OpenAIRealtimeBridge:
             if event_type in {
                 "response.function_call_arguments.done",
                 "response.tool_call_arguments.done",
+                "response.output_item.done",
                 "tool.call.done",
             }:
+                item = event.get("item") if isinstance(event.get("item"), dict) else {}
+                if event_type == "response.output_item.done" and item.get("type") != "function_call":
+                    session.record_event(event_type)
+                    continue
                 await self._handle_tool_call(openai_socket, openai_send_lock, session, event)
                 continue
 
@@ -495,15 +520,25 @@ class OpenAIRealtimeBridge:
         session: RealtimeBridgeSession,
         event: dict[str, Any],
     ) -> None:
-        tool_name = str(event.get("name") or event.get("tool_name") or "")
-        call_id = str(event.get("call_id") or event.get("callId") or event.get("id") or "")
-        raw_arguments = event.get("arguments") or "{}"
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        tool_name = str(event.get("name") or event.get("tool_name") or item.get("name") or "")
+        call_id = str(event.get("call_id") or event.get("callId") or event.get("id") or item.get("call_id") or "")
+        raw_arguments = event.get("arguments") or item.get("arguments") or "{}"
         try:
             arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
         except (TypeError, ValueError):
             arguments = {}
 
         handler = REALTIME_TOOL_HANDLERS.get(tool_name)
+        _log_realtime(
+            "event=realtime_tool_call_received "
+            f"stream_sid={session.stream_sid} tool_name={tool_name} call_id={call_id}"
+        )
+        persist_realtime_call_log(
+            session,
+            event_name="realtime_tool_call_received",
+            payload={"tool_name": tool_name, "call_id": call_id},
+        )
         if handler is None:
             result = {"status": "error", "message": f"Unknown tool: {tool_name}"}
         else:
