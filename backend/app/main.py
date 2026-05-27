@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -24,8 +24,10 @@ from .calendar_service import (
     list_google_calendars,
 )
 from .config import settings
-from .db import Base, ensure_sqlite_compatibility, engine, get_db
+from .db import Base, SessionLocal, ensure_sqlite_compatibility, engine, get_db
+from .duplex import duplex_router
 from .models import AppointmentRequest, Business, CallLog, CallSession
+from .realtime import realtime_router
 from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut, GoogleCalendarSelection
 from .streaming import streaming_router
 
@@ -43,6 +45,10 @@ app.add_middleware(
 )
 
 app.include_router(streaming_router)
+app.include_router(duplex_router)
+app.include_router(realtime_router)
+
+CONVERSATION_RELAY_WS_PATH = "/ws/conversation-relay"
 
 
 @app.get("/")
@@ -83,6 +89,10 @@ def _normalize_business_numbers(
 
 def _log_voice(message: str) -> None:
     print(f"[voice] {message}", flush=True)
+
+
+def _log_relay(message: str) -> None:
+    print(f"[conversation-relay] {message}", flush=True)
 
 
 def _resolve_business(db: Session, to_number: str | None) -> Business | None:
@@ -406,6 +416,92 @@ def _build_voice_gather(prompt: str) -> Gather:
     return gather
 
 
+def _build_websocket_url(request: Request, path: str) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    ws_scheme = "wss" if forwarded_proto == "https" else "ws"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{ws_scheme}://{host}{path}"
+
+
+def _build_conversation_relay_twiml(request: Request, business_context: BusinessContext) -> str:
+    response = VoiceResponse()
+    connect = response.connect()
+    relay = connect.conversation_relay(
+        url=_build_websocket_url(request, CONVERSATION_RELAY_WS_PATH),
+        welcome_greeting=business_context.greeting,
+    )
+    relay.parameter(name="route", value="experimental-conversation-relay")
+    return str(response)
+
+
+def _build_relay_text_message(reply_text: str) -> dict[str, object]:
+    return {
+        "type": "text",
+        "token": reply_text,
+        "last": True,
+        "interruptible": True,
+        "preemptible": True,
+    }
+
+
+def _build_relay_repair_prompt(state: str) -> str:
+    if state == "COLLECTING_APPOINTMENT_DAY":
+        return "What day works best?"
+    if state == "COLLECTING_APPOINTMENT_TIME":
+        return "What time works best?"
+    if state == "COLLECTING_CALLBACK_NUMBER":
+        return "What's the best callback number?"
+    if state == "COLLECTING_CALLER_NAME":
+        return "What name should I use?"
+    return "Could you say that another way?"
+
+
+def _shape_relay_booking_response(
+    *,
+    result_intent: str,
+    result_state: str,
+    result_response: str,
+    slot_data: dict[str, str],
+    session_state: str,
+    transcript: list[dict[str, str]],
+) -> tuple[str, str]:
+    if result_intent != "BOOK_APPOINTMENT":
+        if result_state == "GENERAL_ASSISTANCE":
+            return result_state, _build_relay_repair_prompt(session_state)
+        return result_state, result_response
+
+    has_day = bool(slot_data.get("appointment_day"))
+    has_time = bool(slot_data.get("appointment_time"))
+    has_number = bool(slot_data.get("callback_number"))
+    has_name = bool(slot_data.get("caller_name"))
+
+    if not has_day and not has_time:
+        next_state = "COLLECTING_APPOINTMENT_DAY"
+        response = "Sure — what day and time work best?"
+    elif has_day and not has_time:
+        next_state = "COLLECTING_APPOINTMENT_TIME"
+        response = "What time works best?"
+    elif has_time and not has_day:
+        next_state = "COLLECTING_APPOINTMENT_DAY"
+        response = "What day works best?"
+    elif not has_number:
+        next_state = "COLLECTING_CALLBACK_NUMBER"
+        response = "What's the best callback number?"
+    elif not has_name:
+        next_state = "COLLECTING_CALLER_NAME"
+        response = "What name should I use?"
+    else:
+        return result_state, result_response
+
+    last_assistant_text = next(
+        (item.get("text", "") for item in reversed(transcript) if item.get("role") == "assistant"),
+        "",
+    )
+    if response == last_assistant_text and next_state == session_state:
+        response = _build_relay_repair_prompt(next_state)
+    return next_state, response
+
+
 def _get_request_validation_url(request: Request) -> str:
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
@@ -424,6 +520,359 @@ def _is_valid_twilio_request(request: Request, form_data: dict[str, str | None])
     validator = RequestValidator(settings.twilio_auth_token)
     params = {key: value or "" for key, value in form_data.items()}
     return validator.validate(_get_request_validation_url(request), params, signature)
+
+
+def _get_websocket_validation_url(websocket: WebSocket) -> str:
+    forwarded_proto = websocket.headers.get("x-forwarded-proto", "https")
+    scheme = "https" if forwarded_proto in {"http", "https"} else "https"
+    host = websocket.headers.get("x-forwarded-host") or websocket.headers.get("host") or "localhost"
+    query = f"?{websocket.url.query}" if websocket.url.query else ""
+    return f"{scheme}://{host}{websocket.url.path}{query}"
+
+
+def _is_valid_twilio_websocket(websocket: WebSocket) -> bool:
+    if settings.disable_twilio_signature_validation:
+        return True
+
+    signature = websocket.headers.get("x-twilio-signature", "")
+    if not settings.twilio_auth_token or not signature:
+        return False
+
+    validator = RequestValidator(settings.twilio_auth_token)
+    return validator.validate(_get_websocket_validation_url(websocket), {}, signature)
+
+
+def _record_relay_greeting(
+    db: Session,
+    *,
+    call_sid: str | None,
+    from_number: str | None,
+    to_number: str | None,
+    call_status: str | None,
+) -> CallSession | None:
+    if not call_sid:
+        return None
+    session, _ = _get_or_create_session(db, call_sid, from_number, to_number)
+    business = _resolve_business(db, to_number)
+    business_context = _build_business_context(business)
+    session_context = _build_session_context(session)
+    session.current_state = "GREETING_SENT"
+    session.transcript_json = json.dumps(
+        _append_transcript(session_context.transcript, "assistant", business_context.greeting)
+    )
+    session.slot_data_json = json.dumps(_clear_silence_count(session_context.slot_data))
+    session.last_protection_reason = None
+    session.is_active = not _is_terminal_call_status(call_status)
+    db.commit()
+    return session
+
+
+def _relay_process_prompt(
+    db: Session,
+    *,
+    call_sid: str | None,
+    from_number: str | None,
+    to_number: str | None,
+    call_status: str | None,
+    speech: str,
+) -> str:
+    normalized_speech = " ".join(speech.split()).strip()
+    session: CallSession | None = None
+    session_context = SessionContext()
+    if call_sid:
+        session = db.query(CallSession).filter(CallSession.call_sid == call_sid).first()
+        session_context = _build_session_context(session)
+    if not normalized_speech:
+        return _build_relay_repair_prompt(session_context.current_state)
+
+    if not call_sid or not from_number:
+        prompt = "Sorry, we could not process this call. Please try again later."
+        _record_protection_log(
+            db,
+            reason="malformed_request",
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            call_status=call_status,
+            ai_response=prompt,
+            speech_input=normalized_speech,
+        )
+        db.commit()
+        _log_relay(
+            f"event=tool_state_transition call_sid={call_sid} reason=malformed_request state=END"
+        )
+        return prompt
+
+    if session is None:
+        session, _ = _get_or_create_session(db, call_sid, from_number, to_number)
+    session_context = _build_session_context(session)
+    business = _resolve_business(db, to_number)
+    business_context = _build_business_context(business)
+    state_before = session_context.current_state
+
+    if session is not None:
+        session.turn_count = (session.turn_count or 0) + 1
+
+    transcript = _append_transcript(session_context.transcript, "user", normalized_speech)
+    session_context.transcript = transcript
+    protection_reason: str | None = None
+    llm_limit_exceeded = (
+        session is not None
+        and bool(settings.openai_api_key)
+        and session.llm_call_count >= settings.max_llm_calls_per_session
+    )
+    if llm_limit_exceeded:
+        protection_reason = "llm_limit_exceeded"
+        result = detect_and_respond(
+            normalized_speech,
+            business_context,
+            session_context,
+            force_fallback_reason=protection_reason,
+        )
+    else:
+        if session is not None and settings.openai_api_key:
+            session.llm_call_count = (session.llm_call_count or 0) + 1
+        result = detect_and_respond(normalized_speech, business_context, session_context)
+
+    merged_slot_data = _clear_silence_count(_merge_session_slots(session_context.slot_data, result.fields))
+    speech_safe_response = _build_speech_safe_response(
+        result.intent,
+        result.state,
+        result.response,
+        merged_slot_data,
+    )
+    relay_state, speech_safe_response = _shape_relay_booking_response(
+        result_intent=result.intent,
+        result_state=result.state,
+        result_response=speech_safe_response,
+        slot_data=merged_slot_data,
+        session_state=session_context.current_state,
+        transcript=session_context.transcript,
+    )
+    result.state = relay_state
+    result.response = speech_safe_response
+    updated_transcript = _append_transcript(transcript, "assistant", speech_safe_response)
+
+    if _should_create_request(result.intent, result.state, merged_slot_data):
+        appointment = AppointmentRequest(
+            business_id=business_context.id,
+            caller_name=merged_slot_data.get("caller_name"),
+            caller_phone=merged_slot_data.get("callback_number") or from_number,
+            requested_time=_build_requested_time(merged_slot_data),
+            notes=normalized_speech,
+        )
+        if _should_create_calendar_event(result.intent, result.state, merged_slot_data):
+            try:
+                requested_start, requested_end = build_appointment_window(
+                    appointment_day=merged_slot_data["appointment_day"],
+                    appointment_time=merged_slot_data["appointment_time"],
+                    timezone_str=settings.google_timezone,
+                    duration_minutes=settings.appointment_duration_minutes,
+                )
+                business_token_json = business.google_token_json if business is not None else None
+                business_calendar_id = (
+                    business.google_calendar_id
+                    if business is not None and business.google_calendar_connected and business.google_calendar_id
+                    else None
+                )
+                availability = check_calendar_availability(
+                    start=requested_start,
+                    end=requested_end,
+                    token_json=business_token_json,
+                    calendar_id=business_calendar_id,
+                    timezone_str=settings.google_timezone,
+                )
+                if not availability.available:
+                    speech_safe_response = _calendar_unavailable_with_suggestion_response(
+                        availability.suggested_slots[0] if availability.suggested_slots else None
+                    )
+                    raise CalendarServiceError("Requested appointment window overlaps an existing calendar event.")
+                calendar_booking = create_calendar_booking(
+                    caller_name=merged_slot_data.get("caller_name"),
+                    callback_number=merged_slot_data["callback_number"],
+                    appointment_day=merged_slot_data["appointment_day"],
+                    appointment_time=merged_slot_data["appointment_time"],
+                    notes=normalized_speech,
+                    token_json=business_token_json,
+                    calendar_id=business_calendar_id,
+                    timezone_str=settings.google_timezone,
+                )
+                appointment.calendar_event_id = calendar_booking.event_id
+                appointment.calendar_event_link = calendar_booking.html_link
+                appointment.scheduled_start = calendar_booking.scheduled_start
+                appointment.scheduled_end = calendar_booking.scheduled_end
+                appointment.confirmed = True
+                speech_safe_response = (
+                    f"Thanks {merged_slot_data.get('caller_name') or ''}. "
+                    f"You're booked for {merged_slot_data['appointment_day']} at {merged_slot_data['appointment_time']}."
+                ).replace("  ", " ").strip()
+            except CalendarServiceError as exc:
+                _log_relay(f"event=calendar_booking_failed reason=calendar_service_error error={exc}")
+                if "overlaps an existing calendar event" in str(exc):
+                    speech_safe_response = speech_safe_response or _calendar_unavailable_response()
+                else:
+                    speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
+            except Exception as exc:
+                _log_relay(f"event=calendar_booking_failed reason=unexpected_error error={exc}")
+                speech_safe_response = "I have your request and someone from the office will confirm the appointment shortly."
+        db.add(appointment)
+        merged_slot_data["request_saved"] = "true"
+        _log_relay(
+            f"event=tool_state_transition call_sid={call_sid} tool=appointment_request "
+            f"state=saved business_id={business_context.id}"
+        )
+
+    log = CallLog(
+        business_id=business_context.id,
+        call_sid=call_sid,
+        from_number=from_number,
+        to_number=to_number,
+        speech_input=normalized_speech,
+        ai_response=speech_safe_response,
+        call_status=call_status,
+        detected_intent=result.intent,
+        intent_data=result.to_json(),
+        protection_reason=protection_reason,
+    )
+    db.add(log)
+
+    if session is not None:
+        session.current_intent = result.intent
+        session.current_state = result.state
+        session.slot_data_json = json.dumps(merged_slot_data)
+        session.transcript_json = json.dumps(updated_transcript)
+        session.last_protection_reason = protection_reason
+        session.is_active = not _is_terminal_call_status(call_status)
+
+    db.commit()
+    _log_relay(
+        f"event=tool_state_transition call_sid={call_sid} intent={result.intent} "
+        f"state_before={state_before} state_after={result.state} fields={result.fields}"
+    )
+    return speech_safe_response
+
+
+@app.post(settings.conversation_relay_route)
+async def voice_relay(request: Request, db: Session = Depends(get_db)):
+    if not settings.enable_conversation_relay_experiment:
+        _log_relay("event=route_disabled")
+        return _build_terminal_voice_response("The Conversation Relay experiment is not enabled.")
+
+    form = await request.form()
+    form_data = {key: form.get(key) for key in form.keys()}
+    if not _is_valid_twilio_request(request, form_data):
+        _log_relay("event=request_rejected reason=invalid_twilio_signature")
+        return Response(content="Forbidden", status_code=403, media_type="text/plain")
+
+    to_number = form.get("To")
+    business = _resolve_business(db, to_number)
+    business_context = _build_business_context(business)
+    twiml = _build_conversation_relay_twiml(request, business_context)
+    _log_relay(
+        "event=twiml_generated "
+        f"route={settings.conversation_relay_route} websocket_path={CONVERSATION_RELAY_WS_PATH} "
+        f"call_sid={form.get('CallSid')} from_number={form.get('From')} to_number={to_number} "
+        f"business_id={business_context.id}"
+    )
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.websocket(CONVERSATION_RELAY_WS_PATH)
+async def conversation_relay_websocket(websocket: WebSocket):
+    await websocket.accept()
+    if not settings.enable_conversation_relay_experiment:
+        _log_relay("event=websocket_rejected reason=experiment_disabled")
+        await websocket.close(code=1008)
+        return
+    if not _is_valid_twilio_websocket(websocket):
+        _log_relay("event=websocket_rejected reason=invalid_twilio_signature")
+        await websocket.close(code=1008)
+        return
+
+    db = SessionLocal()
+    session_id: str | None = None
+    call_sid: str | None = None
+    from_number: str | None = None
+    to_number: str | None = None
+    call_status: str | None = None
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            message_type = str(payload.get("type") or "").lower()
+
+            if message_type == "setup":
+                session_id = str(payload.get("sessionId") or "unknown-relay-session")
+                call_sid = payload.get("callSid")
+                from_number = payload.get("from")
+                to_number = payload.get("to")
+                call_status = payload.get("callStatus")
+                session = _record_relay_greeting(
+                    db,
+                    call_sid=call_sid,
+                    from_number=from_number,
+                    to_number=to_number,
+                    call_status=call_status,
+                )
+                _log_relay(
+                    f"event=session_start session_id={session_id} call_sid={call_sid} "
+                    f"from_number={from_number} to_number={to_number} "
+                    f"state={session.current_state if session else 'NEW'}"
+                )
+                continue
+
+            if message_type == "prompt":
+                transcript_text = str(payload.get("voicePrompt") or "")
+                is_final = bool(payload.get("last", True))
+                _log_relay(
+                    f"event=user_transcript session_id={session_id} call_sid={call_sid} "
+                    f"last={str(is_final).lower()} transcript={transcript_text!r}"
+                )
+                if not is_final:
+                    continue
+                reply_text = _relay_process_prompt(
+                    db,
+                    call_sid=call_sid,
+                    from_number=from_number,
+                    to_number=to_number,
+                    call_status=call_status,
+                    speech=transcript_text,
+                )
+                _log_relay(
+                    f"event=assistant_response session_id={session_id} "
+                    f"call_sid={call_sid} response={reply_text!r}"
+                )
+                await websocket.send_json(_build_relay_text_message(reply_text))
+                continue
+
+            if message_type == "dtmf":
+                digit = str(payload.get("digit") or "")
+                _log_relay(
+                    f"event=tool_state_transition session_id={session_id} call_sid={call_sid} "
+                    f"type=dtmf digit={digit!r} state=ignored"
+                )
+                continue
+
+            if message_type == "interrupt":
+                _log_relay(
+                    f"event=tool_state_transition session_id={session_id} call_sid={call_sid} "
+                    "type=interrupt state=received"
+                )
+                continue
+
+            if message_type == "error":
+                _log_relay(
+                    f"event=relay_error session_id={session_id} call_sid={call_sid} "
+                    f"description={payload.get('description')!r}"
+                )
+                continue
+
+            _log_relay(
+                f"event=ignored_message session_id={session_id} call_sid={call_sid} type={message_type!r}"
+            )
+    except WebSocketDisconnect:
+        _log_relay(f"event=session_end session_id={session_id} call_sid={call_sid} reason=disconnect")
+    finally:
+        db.close()
 
 
 @app.post("/voice")

@@ -148,6 +148,171 @@ def test_voice_initial_request_returns_gather_and_fallback_greeting(client, db_s
         assert "Bright Smile Dental" in transcript[-1]["text"]
 
 
+def test_voice_relay_disabled_returns_safe_twilml_error(client, monkeypatch):
+    monkeypatch.setattr(settings, "enable_conversation_relay_experiment", False)
+
+    res = client.post("/voice-relay")
+
+    assert res.status_code == 200
+    assert "application/xml" in res.headers["content-type"]
+    xml = _parse_xml(res.text)
+    assert xml.find("Say") is not None
+    assert xml.find("Hangup") is not None
+    assert "Conversation Relay experiment is not enabled" in res.text
+
+
+def test_voice_relay_enabled_returns_conversationrelay_twilml(client, monkeypatch):
+    monkeypatch.setattr(settings, "enable_conversation_relay_experiment", True)
+
+    res = client.post(
+        "/voice-relay",
+        data={
+            "CallSid": "CA-relay",
+            "From": "+15551230000",
+            "To": "+15557654321",
+            "CallStatus": "ringing",
+        },
+        headers={"host": "example.ngrok.app", "x-forwarded-proto": "https"},
+    )
+
+    assert res.status_code == 200
+    assert "application/xml" in res.headers["content-type"]
+    xml = _parse_xml(res.text)
+    connect = xml.find("Connect")
+    assert connect is not None
+    relay = connect.find("ConversationRelay")
+    assert relay is not None
+    assert relay.attrib["url"] == "wss://example.ngrok.app/ws/conversation-relay"
+    assert relay.attrib["welcomeGreeting"] == settings.business_greeting
+    parameter = relay.find("Parameter")
+    assert parameter is not None
+    assert parameter.attrib["name"] == "route"
+    assert parameter.attrib["value"] == "experimental-conversation-relay"
+
+
+def test_voice_relay_booking_start_uses_natural_day_time_prompt(db_session: sessionmaker):
+    with db_session() as db:
+        reply = main_module._relay_process_prompt(
+            db,
+            call_sid="CA-relay-booking-start",
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="I want to book an appointment",
+        )
+
+        assert reply == "Sure — what day and time work best?"
+        session = db.query(CallSession).filter(CallSession.call_sid == "CA-relay-booking-start").one()
+        assert session.current_intent == "BOOK_APPOINTMENT"
+        assert session.current_state == "COLLECTING_APPOINTMENT_DAY"
+
+
+def test_voice_relay_booking_date_without_time_asks_for_time(db_session: sessionmaker):
+    call_sid = "CA-relay-date-only"
+    with db_session() as db:
+        main_module._relay_process_prompt(
+            db,
+            call_sid=call_sid,
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="I need to book an appointment",
+        )
+        reply = main_module._relay_process_prompt(
+            db,
+            call_sid=call_sid,
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="Tuesday",
+        )
+
+        assert reply == "What time works best?"
+        session = db.query(CallSession).filter(CallSession.call_sid == call_sid).one()
+        slot_data = json.loads(session.slot_data_json)
+        assert session.current_state == "COLLECTING_APPOINTMENT_TIME"
+        assert slot_data["appointment_day"] == "Tuesday"
+        assert "appointment_time" not in slot_data
+
+
+def test_voice_relay_booking_time_without_date_asks_for_day(db_session: sessionmaker):
+    with db_session() as db:
+        reply = main_module._relay_process_prompt(
+            db,
+            call_sid="CA-relay-time-only",
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="I want to book at 3 pm",
+        )
+
+        assert reply == "What day works best?"
+        session = db.query(CallSession).filter(CallSession.call_sid == "CA-relay-time-only").one()
+        slot_data = json.loads(session.slot_data_json)
+        assert session.current_state == "COLLECTING_APPOINTMENT_DAY"
+        assert slot_data["appointment_time"] == "3 pm"
+        assert "appointment_day" not in slot_data
+
+
+def test_voice_relay_booking_day_and_time_moves_to_callback_collection(db_session: sessionmaker):
+    call_sid = "CA-relay-day-time"
+    with db_session() as db:
+        main_module._relay_process_prompt(
+            db,
+            call_sid=call_sid,
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="I need to book an appointment",
+        )
+        reply = main_module._relay_process_prompt(
+            db,
+            call_sid=call_sid,
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="Tuesday at 3 pm",
+        )
+
+        assert reply == "What's the best callback number?"
+        session = db.query(CallSession).filter(CallSession.call_sid == call_sid).one()
+        slot_data = json.loads(session.slot_data_json)
+        assert session.current_state == "COLLECTING_CALLBACK_NUMBER"
+        assert slot_data["appointment_day"] == "Tuesday"
+        assert slot_data["appointment_time"] == "3 pm"
+
+
+def test_voice_relay_empty_prompt_uses_state_specific_repair(db_session: sessionmaker):
+    call_sid = "CA-relay-repair"
+    with db_session() as db:
+        main_module._relay_process_prompt(
+            db,
+            call_sid=call_sid,
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="I need to book an appointment",
+        )
+        main_module._relay_process_prompt(
+            db,
+            call_sid=call_sid,
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="Tuesday",
+        )
+        reply = main_module._relay_process_prompt(
+            db,
+            call_sid=call_sid,
+            from_number="+15551230000",
+            to_number="+15557654321",
+            call_status="in-progress",
+            speech="",
+        )
+
+        assert reply == "What time works best?"
+
+
 def test_voice_initial_request_uses_business_greeting_when_business_matches(client, db_session: sessionmaker):
     with db_session() as db:
         db.add(

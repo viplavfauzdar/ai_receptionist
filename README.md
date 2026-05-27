@@ -40,11 +40,15 @@ The backend does not connect to ngrok directly. `ngrok` is a separate local proc
 ```mermaid
 flowchart LR
     Caller[Phone Caller] --> Twilio[Twilio Voice]
-    Twilio -->|HTTP POST /voice| Ngrok[ngrok public URL]
+    Twilio -->|HTTP POST /voice or /voice-realtime| Ngrok[ngrok public URL]
     Ngrok -->|Tunnel to localhost:8000| FastAPI[FastAPI backend]
     FastAPI --> AI[OpenAI or fallback reply logic]
     FastAPI --> DB[(SQLite)]
+    FastAPI -->|Completed booking| Calendar{Calendar target}
+    Calendar -->|Business OAuth token + selected calendar| GoogleCalendar[Google Calendar API]
+    Calendar -->|Fallback token.json + GOOGLE_CALENDAR_ID| GoogleCalendar
     FastAPI -->|TwiML XML with <Say> and <Gather>| Ngrok
+    FastAPI -->|Realtime stream audio| OpenAIRealtime[OpenAI Realtime]
     Ngrok --> Twilio
     Twilio -->|Text-to-speech playback| Caller
 ```
@@ -57,6 +61,7 @@ Runtime responsibilities:
 - SQLite stores businesses, call logs, appointment requests, and call sessions.
 - OpenAI generates the receptionist response when `OPENAI_API_KEY` is configured; otherwise the app uses fallback logic.
 - `/voice` validates the Twilio signature by default before processing the webhook.
+- Google Calendar booking targets the connected business calendar first. If a business has not completed Google OAuth onboarding, the backend falls back to the local `token.json` account and `GOOGLE_CALENDAR_ID`, which defaults to `primary`.
 
 Code locations:
 - Twilio webhook and TwiML generation: [`backend/app/main.py`](backend/app/main.py)
@@ -96,6 +101,15 @@ OPENAI_MODEL=gpt-4o-mini
 ENABLE_STREAMING_VOICE_EXPERIMENT=false
 STREAMING_WS_PATH=/ws/media-stream
 STREAMING_VOICE_ROUTE=/voice-stream
+ENABLE_CONVERSATION_RELAY_EXPERIMENT=false
+CONVERSATION_RELAY_ROUTE=/voice-relay
+ENABLE_OPENAI_REALTIME_EXPERIMENT=false
+OPENAI_REALTIME_ROUTE=/voice-realtime
+OPENAI_REALTIME_WS_PATH=/ws/openai-realtime
+OPENAI_REALTIME_MODEL=gpt-realtime
+OPENAI_REALTIME_VOICE=marin
+ENABLE_REALTIME_BARGE_IN=false
+REALTIME_TURN_DETECTION_TYPE=semantic_vad
 STREAMING_STT_BUFFER_BYTES=32000
 MAX_CALL_TURNS=12
 MAX_LLM_CALLS_PER_SESSION=6
@@ -142,12 +156,15 @@ Behavior:
 - CORS is restricted by `CORS_ALLOWED_ORIGINS`; the default allows only local frontend origins.
 - The existing `POST /voice` TwiML flow remains the primary production path.
 - A separate experimental streaming path now exists via `POST /voice-stream` plus WebSocket media streaming on `/ws/media-stream`. It is isolated from the current booking and TwiML flow and is intended for lower-latency future work.
+- A separate experimental ConversationRelay path now exists via `POST /voice-relay` plus WebSocket events on `/ws/conversation-relay`. It is disabled by default with `ENABLE_CONVERSATION_RELAY_EXPERIMENT=false`.
+- A separate experimental full-duplex skeleton now exists via `POST /voice-duplex` plus WebSocket media streaming on `/ws/voice-duplex`. It is intentionally separate from `/voice`, `/voice-stream`, and `/voice-relay`.
+- A separate experimental OpenAI Realtime bridge now exists via `POST /voice-realtime` plus WebSocket media streaming on `/ws/openai-realtime`. It is intentionally separate from the `/voice-duplex` skeleton and disabled by default.
 - Abuse protections are config-driven: `MAX_CALL_TURNS` ends runaway sessions cleanly, `MAX_LLM_CALLS_PER_SESSION` stops repeated model calls and switches to deterministic fallback, and `ENABLE_BASIC_RATE_LIMITING` plus `MAX_NEW_CALLS_PER_NUMBER_PER_HOUR` throttle repeated new calls from the same caller number.
 - If Twilio sends a malformed `/voice` webhook without required identifiers such as `CallSid` or `From`, the backend returns a short TwiML apology and ends the call instead of crashing.
 - Silence handling is deterministic: the first silent turn gets a polite reprompt, the second gets a shorter fallback prompt, and the third ends the call cleanly.
 - When Google Calendar is enabled and a booking is complete, the backend creates a real calendar event and confirms it to the caller. If calendar creation fails, the request is still saved and the caller gets a fallback confirmation.
-- Google Calendar onboarding is now business-linked: a business can connect its own Google account through backend OAuth routes, store its token on the business row, list available calendars, and select which calendar receives bookings.
-- The business-linked token and selected calendar are now the preferred runtime path for booking. The older single `token.json` bootstrap still works as a local fallback when a business has not connected its own calendar yet.
+- Google Calendar onboarding is business-linked: a business can connect its own Google account through backend OAuth routes, store its token on the business row, list available calendars, and select which calendar receives bookings.
+- Calendar selection order is business first, fallback second. The runtime uses `business.google_token_json` plus `business.google_calendar_id` when present; otherwise it uses the legacy local `GOOGLE_TOKEN_FILE` account with `GOOGLE_CALENDAR_ID=primary` by default.
 - Before creating the Google Calendar event, the backend checks the requested window for conflicts. If the slot overlaps an existing active event, the backend does not create the event and asks the caller for another time.
 - When the calendar service can infer a nearby opening after the conflicting event chain, the receptionist offers that suggested slot in the spoken response.
 
@@ -186,6 +203,15 @@ Backend `.env`:
 - `ENABLE_STREAMING_VOICE_EXPERIMENT=false`
 - `STREAMING_WS_PATH=/ws/media-stream`
 - `STREAMING_VOICE_ROUTE=/voice-stream`
+- `ENABLE_CONVERSATION_RELAY_EXPERIMENT=false`
+- `CONVERSATION_RELAY_ROUTE=/voice-relay`
+- `ENABLE_OPENAI_REALTIME_EXPERIMENT=false`
+- `OPENAI_REALTIME_ROUTE=/voice-realtime`
+- `OPENAI_REALTIME_WS_PATH=/ws/openai-realtime`
+- `OPENAI_REALTIME_MODEL=gpt-realtime`
+- `OPENAI_REALTIME_VOICE=marin`
+- `ENABLE_REALTIME_BARGE_IN=false`
+- `REALTIME_TURN_DETECTION_TYPE=semantic_vad`
 - `STREAMING_STT_BUFFER_BYTES=32000`
 - `MAX_CALL_TURNS=12`
 - `MAX_LLM_CALLS_PER_SESSION=6`
@@ -223,6 +249,9 @@ Frontend `.env.local`:
 - Call sessions also track `turn_count`, `llm_call_count`, and `last_protection_reason` to stop runaway loops and excessive model usage.
 - The Twilio voice webhook contract remains `POST /voice`.
 - The experimental streaming webhook is separate at `POST /voice-stream` and does not replace the main `/voice` flow.
+- The experimental ConversationRelay webhook is separate at `POST /voice-relay` and does not replace `/voice` or `/voice-stream`.
+- The experimental full-duplex webhook is separate at `POST /voice-duplex` and does not replace `/voice`, `/voice-stream`, or `/voice-relay`.
+- The experimental OpenAI Realtime webhook is separate at `POST /voice-realtime` and does not replace `/voice`, `/voice-stream`, `/voice-relay`, or `/voice-duplex`.
 - The receptionist is LLM-first when `OPENAI_API_KEY` is configured.
 - Booking and callback intents create a simple database entry in `appointment_requests`.
 - Call logs store `business_id`, `detected_intent`, and structured `intent_data`.
@@ -295,6 +324,97 @@ wss://YOUR-NGROK-URL/ws/media-stream
 ```
 
 This path is now a minimal full loop: inbound Twilio audio, transcript generation, reply text generation, and outbound streamed speech. It is still experimental and does not replace the main receptionist flow yet.
+
+## 6B) Experimental ConversationRelay Path
+
+This is an isolated parallel proof-of-concept using Twilio ConversationRelay.
+
+- Twilio webhook: `POST /voice-relay`
+- WebSocket endpoint: `/ws/conversation-relay`
+- Enable with `ENABLE_CONVERSATION_RELAY_EXPERIMENT=true`
+- Configure the route with `CONVERSATION_RELAY_ROUTE=/voice-relay`
+- TwiML uses `<Connect><ConversationRelay>` so Twilio handles STT and TTS and sends structured transcript events to the backend WebSocket
+- the route returns a safe TwiML error and hangs up while the experiment flag is disabled
+- the relay WebSocket handles `setup`, final `prompt`, `dtmf`, `interrupt`, and `error` messages
+- final caller transcripts reuse the existing receptionist response logic, appointment state, calendar booking checks, and database logging path used by the main voice flow
+- relay booking prompts are shaped to sound more like a front desk receptionist, asking for day and time together first and using short state-specific repair prompts when details are missing
+- relay logs use the `[conversation-relay]` prefix and include session start, user transcript, assistant response, tool/state transitions, relay errors, and session end
+
+Twilio webhook config for this experiment:
+
+```text
+Voice webhook URL: https://YOUR-NGROK-URL/voice-relay
+HTTP method: POST
+WebSocket opened by TwiML: wss://YOUR-NGROK-HOST/ws/conversation-relay
+```
+
+## 6C) Experimental Full-Duplex Voice Skeleton
+
+This is an isolated architecture skeleton for true full-duplex voice using Twilio Media Streams.
+
+- Twilio webhook: `POST /voice-duplex`
+- WebSocket endpoint: `/ws/voice-duplex`
+- TwiML uses `<Connect><Stream>` and points Twilio to `wss://YOUR-NGROK-HOST/ws/voice-duplex`
+- implementation lives under `backend/app/duplex/`
+- runtime stages are separated into inbound audio receiving, STT, agent response generation, TTS sending, and interruption handling
+- `asyncio.Queue` boundaries connect audio frames, transcripts, agent responses, outbound Twilio messages, and interruption events
+- session states are `IDLE`, `LISTENING`, `THINKING`, `SPEAKING`, and `INTERRUPTED`
+- barge-in is a skeleton: while `SPEAKING`, inbound audio energy can cancel the current TTS task, send Twilio `{"event":"clear","streamSid":"..."}`, and return to `LISTENING`
+- provider interfaces are pluggable through `StreamingSTTProvider` and `StreamingTTSProvider`
+- current providers are stubs; Deepgram, OpenAI Realtime, ElevenLabs, or other streaming vendors still need real adapters
+- this path makes no production claim and does not change the current `/voice`, `/voice-stream`, or `/voice-relay` behavior
+
+## 6D) Experimental OpenAI Realtime Bridge
+
+This is an isolated proof-of-concept bridge from Twilio Media Streams to OpenAI Realtime.
+
+- Twilio webhook: `POST /voice-realtime`
+- WebSocket endpoint: `/ws/openai-realtime`
+- Enable with `ENABLE_OPENAI_REALTIME_EXPERIMENT=true`
+- Configure with `OPENAI_REALTIME_ROUTE=/voice-realtime` and `OPENAI_REALTIME_WS_PATH=/ws/openai-realtime`
+- Realtime model and voice come from `OPENAI_REALTIME_MODEL` and `OPENAI_REALTIME_VOICE`; the default Realtime voice is `marin`
+- Realtime turn detection defaults to `REALTIME_TURN_DETECTION_TYPE=semantic_vad`
+- TwiML uses `<Connect><Stream>` and points Twilio to `wss://YOUR-NGROK-HOST/ws/openai-realtime`
+- the bridge connects to the current OpenAI Realtime WebSocket endpoint with `Authorization` only, sends a GA-shaped `session.update` using nested `audio.input.format.type` and `audio.output.format.type` set to `audio/pcmu`, enables input audio transcription with `STREAMING_STT_MODEL`, forwards Twilio inbound G.711 mu-law audio as Realtime input audio, and directly forwards Realtime `audio/pcmu` deltas back to Twilio as `media`
+- Realtime uses model-managed turn taking with `semantic_vad` and `create_response=true`; OpenAI detects end-of-turn and creates responses without the bridge waiting for `transcription.completed`
+- this avoids silence caused by unreliable transcript-gated response creation and feels more conversational than IVR-style manual turn handling
+- final audio flow: Twilio `audio/pcmu` payload -> OpenAI `input_audio_buffer.append` -> OpenAI Realtime `semantic_vad` -> automatic model response -> OpenAI `audio/pcmu` delta -> Twilio `media.payload` direct forward
+- direct audio forwarding is required: do not decode or re-encode OpenAI audio deltas, do not resample, and do not convert PCM; `audio/pcmu` deltas go directly to Twilio `media.payload`
+- Realtime tool-call boundaries exist for `lookup_business`, `check_availability`, `create_booking`, `capture_callback`, and `log_call_summary`
+- Realtime instructions are conversational rather than scripted IVR: short front-desk replies, date and time together for booking, minimal repeated confirmations, and no repeated greeting after the first turn
+- current tool handlers are stubs; they are structured so later patches can call existing business lookup, calendar, booking, callback, and call-log logic
+- barge-in cancellation is disabled by default with `ENABLE_REALTIME_BARGE_IN=false`; when enabled, barge-in is based on OpenAI `input_audio_buffer.speech_started` events, never raw Twilio media frames
+- repeated cancellations usually mean barge-in is being triggered from the wrong signal; raw Twilio media frames arrive continuously and include silence/noise
+- protocol-sensitive Realtime message shapes are isolated in `backend/app/realtime/bridge.py`; the bridge does not send the deprecated `OpenAI-Beta` header
+- this path makes no production claim and does not change `/voice`, `/voice-stream`, `/voice-relay`, or `/voice-duplex`
+
+Troubleshooting:
+
+- Static usually means an audio format mismatch. Twilio expects G.711 mu-law, so Realtime input/output should be `audio/pcmu` and output deltas should be forwarded unchanged.
+- Silence after the greeting usually means response creation or turn gating is wrong. The working path uses `semantic_vad` with `create_response=true`.
+- Rambling usually means VAD auto-response is firing too aggressively or the prompt is over-eager. Tune turn detection and keep the receptionist instructions explicit about waiting for the caller.
+- Repeated cancellations usually mean bad barge-in logic. Barge-in should come from OpenAI `input_audio_buffer.speech_started`, not raw Twilio `media` frames.
+
+Required backend env vars:
+
+```env
+ENABLE_OPENAI_REALTIME_EXPERIMENT=true
+OPENAI_REALTIME_ROUTE=/voice-realtime
+OPENAI_REALTIME_WS_PATH=/ws/openai-realtime
+OPENAI_REALTIME_MODEL=gpt-realtime
+OPENAI_REALTIME_VOICE=marin
+ENABLE_REALTIME_BARGE_IN=false
+REALTIME_TURN_DETECTION_TYPE=semantic_vad
+OPENAI_API_KEY=your_real_openai_api_key
+```
+
+Twilio webhook config:
+
+```text
+Voice webhook URL: https://YOUR-NGROK-URL/voice-realtime
+HTTP method: POST
+WebSocket opened by TwiML: wss://YOUR-NGROK-HOST/ws/openai-realtime
+```
 
 Example 3-turn booking flow:
 1. Caller: `I want to book an appointment`
