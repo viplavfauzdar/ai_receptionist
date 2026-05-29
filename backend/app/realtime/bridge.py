@@ -21,6 +21,8 @@ from .tools import (
 )
 
 REALTIME_TWILIO_AUDIO_FORMAT = {"type": "audio/pcmu"}
+
+# Phrases detected in ASSISTANT speech that signal the call should end
 END_CALL_PHRASES = (
     "goodbye",
     "bye",
@@ -29,6 +31,19 @@ END_CALL_PHRASES = (
     "the office will follow up",
     "we'll follow up",
     "we will follow up",
+)
+
+# Phrases detected in USER speech that signal they are wrapping up
+# When set, the bridge ends the call after the assistant's next response finishes
+USER_FAREWELL_PHRASES = (
+    "goodbye",
+    "bye",
+    "thank you",
+    "thanks",
+    "have a good",
+    "that's all",
+    "that will be all",
+    "talk to you then",
 )
 
 
@@ -64,6 +79,7 @@ def _iter_text_values(value: Any):
 
 
 def _should_end_call(event: dict[str, Any]) -> bool:
+    """Check assistant speech for farewell phrases."""
     text = " ".join(_iter_text_values(event)).lower()
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -71,6 +87,20 @@ def _should_end_call(event: dict[str, Any]) -> bool:
 
     for phrase in END_CALL_PHRASES:
         if phrase == "bye":
+            if re.search(r"\bbye\b", text):
+                return True
+            continue
+        if phrase in text:
+            return True
+    return False
+
+
+def _user_said_farewell(transcript: str) -> bool:
+    """Check user transcript for farewell/wrap-up phrases."""
+    text = transcript.lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    for phrase in USER_FAREWELL_PHRASES:
+        if phrase in ("bye",):
             if re.search(r"\bbye\b", text):
                 return True
             continue
@@ -89,25 +119,23 @@ def build_realtime_receptionist_instructions() -> str:
     booking_status = "enabled" if settings.booking_enabled else "disabled"
     return "\n".join(
         [
-            f"You are the calm, friendly dental front-desk receptionist for {settings.business_name}.",
+            f"You are a warm, upbeat dental receptionist for {settings.business_name}. You genuinely enjoy helping people.",
             f"Business hours: {settings.business_hours}. Booking is {booking_status}.",
-            "Speak naturally, like a helpful person at the front desk, not an IVR script.",
-            "Keep most responses under 12 words.",
+            "Sound like a friendly human — natural, cheerful, and brief. Never robotic or scripted.",
+            "Keep responses short: one or two sentences at most.",
             "Do not repeat the greeting after the first turn.",
-            "Do not say 'I can help with that' repeatedly.",
-            "Do not ask one slot at a time unless necessary.",
-            "Do not assume the caller wants an appointment.",
-            "Do not advance booking flow until the caller clearly asks.",
-            "After the greeting, wait silently for the caller.",
-            "Never ask for date or time unless appointment intent is clear.",
-            "Never produce repair prompts unless the caller actually spoke.",
-            "Ask for date and time together when booking.",
-            "If the caller says appointment, say: Sure — what day and time works best?",
-            "If the caller gives date and time, ask for name and callback number together.",
-            "After collecting date, time, name, and callback number, call the book_appointment tool.",
-            "Do not over-confirm every field; save confirmation for the final summary.",
-            "Use natural repair prompts: I missed the number. Could you repeat it?",
-            "Use natural repair prompts: What day works best? What time works best?",
+            "Do not assume the caller wants an appointment. Let them lead.",
+            "Do not start the booking flow until the caller clearly says they want one.",
+            "When the caller wants to book, ask for day and time in one warm question, like: 'What day and time works for you?'",
+            "Once you have day and time, ask for name and callback number together in one question.",
+            "Once you have all four — day, time, name, number — call the book_appointment tool right away.",
+            "Include the appointment type (e.g. deep cleaning, checkup, whitening) in the notes field.",
+            "Pass just the weekday in appointment_day (e.g. 'Wednesday', not 'next Wednesday').",
+            "After booking succeeds, confirm warmly in one sentence using the specific date (e.g. 'June 4th', not just 'Wednesday'), the time, and the caller's name.",
+            "Then pause and let the caller respond — do not ask 'Is there anything else?' immediately.",
+            "When the caller says thanks, thank you, bye, goodbye, or sounds like they are wrapping up: say a single warm farewell — e.g. 'You're welcome, bye!' or 'Talk to you then, bye!' — and stop. Do not ask follow-up questions.",
+            "Never say 'Hello?' or re-greet after the caller says goodbye.",
+            "If you missed something, ask for just that one thing in a natural way.",
         ]
     )
 
@@ -257,6 +285,17 @@ class OpenAIRealtimeBridge:
                     await openai_socket.close()
                 except Exception:
                     pass
+            # If the call ended because the user (or assistant) said goodbye, give
+            # Twilio a moment to finish draining already-buffered audio before we
+            # close the WebSocket. This prevents the farewell from being cut off
+            # mid-word. The sleep runs here — in handle's finally — so it cannot
+            # be cancelled the way a task-internal sleep would be.
+            if session.user_said_goodbye:
+                await asyncio.sleep(3.0)
+            try:
+                await twilio_websocket.close(code=1000)
+            except Exception:
+                pass
             persist_realtime_call_end(session)
             _log_realtime(
                 f"event=cleanup stream_sid={session.stream_sid} "
@@ -417,14 +456,13 @@ class OpenAIRealtimeBridge:
                 session.openai_response_active = False
                 session.record_event(event_type)
                 persist_realtime_transcript(session, role="assistant", text=_event_text_summary(event))
-                if _should_end_call(event):
-                    _log_realtime(f"event=end_call_requested stream_sid={session.stream_sid} reason=response_done")
+                if _should_end_call(event) or session.user_said_goodbye:
+                    reason = "response_done" if _should_end_call(event) else "user_said_goodbye"
+                    _log_realtime(f"event=end_call_requested stream_sid={session.stream_sid} reason={reason}")
                     persist_realtime_call_end(session)
+                    # Signal all loops to stop. The drain sleep and WebSocket close
+                    # happen in handle()'s finally block where they cannot be cancelled.
                     stop_event.set()
-                    try:
-                        await twilio_websocket.close(code=1000)
-                    except Exception:
-                        pass
                     return
                 continue
 
@@ -445,6 +483,25 @@ class OpenAIRealtimeBridge:
                 )
                 persist_realtime_transcript(session, role="user", text=transcript)
                 session.record_event(event_type)
+                if _user_said_farewell(transcript):
+                    _log_realtime(
+                        f"event=user_farewell_detected stream_sid={session.stream_sid} "
+                        f"transcript={transcript}"
+                    )
+                    session.user_said_goodbye = True
+                    # Race condition: response.done may have already fired before this
+                    # transcription event arrived (semantic VAD starts the model fast).
+                    # If no response is currently active, we missed our hangup window —
+                    # trigger it now directly.
+                    if not session.openai_response_active:
+                        _log_realtime(
+                            f"event=end_call_requested stream_sid={session.stream_sid} "
+                            "reason=user_farewell_post_response"
+                        )
+                        persist_realtime_call_end(session)
+                        # Drain sleep and WebSocket close happen in handle()'s finally.
+                        stop_event.set()
+                        return
                 continue
 
             if event_type in {

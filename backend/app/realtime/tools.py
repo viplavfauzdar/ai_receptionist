@@ -195,25 +195,18 @@ def _appointment_result(
     *,
     calendar_status: str,
     duplicate: bool = False,
+    appointment_day: str = "",
+    appointment_time: str = "",
 ) -> dict[str, Any]:
     return {
-        "status": "ok",
+        "status": "ok" if not duplicate else "duplicate",
         "appointment_request_id": appointment.id,
-        "business_id": appointment.business_id,
         "calendar_status": calendar_status,
-        "calendar_event_id": appointment.calendar_event_id,
-        "calendar_event_link": appointment.calendar_event_link,
         "confirmed": bool(appointment.confirmed),
-        "duplicate": duplicate,
-        "message": (
-            "Existing appointment request reused."
-            if duplicate
-            else (
-                "Appointment booked on the calendar."
-                if appointment.confirmed
-                else "Appointment request saved; the office will confirm it."
-            )
-        ),
+        "appointment_day": appointment_day,
+        "appointment_time": appointment_time,
+        "caller_name": appointment.caller_name,
+        "callback_number": appointment.caller_phone,
     }
 
 
@@ -471,6 +464,8 @@ async def book_appointment(session: RealtimeBridgeSession, arguments: dict[str, 
                 existing_appointment,
                 calendar_status="existing" if existing_appointment.calendar_event_id else "existing_without_calendar",
                 duplicate=True,
+                appointment_day=str(arguments.get("appointment_day") or ""),
+                appointment_time=str(arguments.get("appointment_time") or ""),
             )
 
         calendar_status = "disabled"
@@ -549,7 +544,12 @@ async def book_appointment(session: RealtimeBridgeSession, arguments: dict[str, 
                 "calendar_event_id": appointment.calendar_event_id,
             },
         )
-        return _appointment_result(appointment, calendar_status=calendar_status)
+        return _appointment_result(
+            appointment,
+            calendar_status=calendar_status,
+            appointment_day=str(arguments.get("appointment_day") or ""),
+            appointment_time=str(arguments.get("appointment_time") or ""),
+        )
     finally:
         db.close()
 

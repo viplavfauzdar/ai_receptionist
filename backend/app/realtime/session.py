@@ -20,6 +20,7 @@ class RealtimeBridgeSession:
     openai_audio_deltas: int = 0
     clear_messages_sent: int = 0
     call_end_logged: bool = False
+    user_said_goodbye: bool = False
     event_history: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
