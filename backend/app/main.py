@@ -1,9 +1,10 @@
 import json
+import secrets
 from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.orm import Session
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Gather, VoiceResponse
@@ -14,12 +15,15 @@ from .ai import (
     detect_and_respond,
     format_phone_number_for_speech,
 )
+from .auth import create_session_token, get_current_user
 from .calendar_service import (
     CalendarServiceError,
     build_appointment_window,
     check_calendar_availability,
+    create_google_auth_url,
     create_google_oauth_authorization_url,
     create_calendar_booking,
+    exchange_google_auth_code,
     exchange_google_oauth_code,
     list_google_calendars,
 )
@@ -28,7 +32,7 @@ from .db import Base, SessionLocal, ensure_sqlite_compatibility, engine, get_db
 from .duplex import duplex_router
 from .models import AppointmentRequest, Business, CallLog, CallSession
 from .realtime import realtime_router
-from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, CallLogOut, GoogleCalendarSelection
+from .schemas import AppointmentCreate, AppointmentOut, BusinessCreate, BusinessOut, BusinessPatch, CallLogOut, GoogleCalendarSelection
 from .streaming import streaming_router
 
 Base.metadata.create_all(bind=engine)
@@ -40,7 +44,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origin_list,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -355,6 +359,61 @@ def _is_rate_limited_new_call(db: Session, from_number: str | None) -> bool:
     if not settings.enable_basic_rate_limiting or not from_number:
         return False
     return _count_recent_calls_for_number(db, from_number) >= settings.max_new_calls_per_number_per_hour
+
+
+# ---------------------------------------------------------------------------
+# Demo rate limiting — in-memory, resets on restart (fine for single-process MVP)
+# ---------------------------------------------------------------------------
+# { normalized_from_number: [timestamp, ...] }  — per-caller hourly window
+_demo_caller_timestamps: dict[str, list[datetime]] = {}
+# Running count of demo calls today; resets when _demo_day changes
+_demo_day: str = ""
+_demo_day_count: int = 0
+
+
+def _is_demo_call(to_number: str | None) -> bool:
+    """True if this call is directed at the configured demo number."""
+    if not settings.demo_twilio_number or not to_number:
+        return False
+    return _normalize_phone_number(to_number) == _normalize_phone_number(settings.demo_twilio_number)
+
+
+def _demo_rate_limit_check(from_number: str | None) -> str | None:
+    """
+    Returns a rejection message if the demo call should be blocked, else None.
+    Updates counters on the way through.
+    """
+    global _demo_day, _demo_day_count
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Reset daily counter if the day rolled over
+    if today != _demo_day:
+        _demo_day = today
+        _demo_day_count = 0
+
+    # Global daily cap
+    if _demo_day_count >= settings.demo_max_calls_per_day_total:
+        return "The demo is unavailable right now. Please try again tomorrow."
+
+    # Per-caller hourly cap
+    if from_number:
+        key = _normalize_phone_number(from_number) or from_number
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=1)
+        recent = [t for t in _demo_caller_timestamps.get(key, []) if t >= cutoff]
+        if len(recent) >= settings.demo_max_calls_per_number_per_hour:
+            return "You've reached the demo call limit. Please try again in an hour."
+        recent.append(now)
+        _demo_caller_timestamps[key] = recent
+
+    _demo_day_count += 1
+    return None
+
+
+def _is_demo_turn_limit_reached(session: CallSession) -> bool:
+    """True when a demo call has used up its allotted turns."""
+    return (session.turn_count or 0) >= settings.demo_max_turns
 
 
 def _is_terminal_call_status(call_status: str | None) -> bool:
@@ -912,7 +971,35 @@ async def voice(request: Request, db: Session = Depends(get_db)):
         return _build_terminal_voice_response(prompt)
 
     existing_session = db.query(CallSession).filter(CallSession.call_sid == call_sid).first()
-    if existing_session is None and _is_rate_limited_new_call(db, from_number):
+
+    # ── Demo-number checks (before any LLM call or session creation) ──────────
+    if _is_demo_call(to_number):
+        if existing_session is None:
+            # New demo call — check rate limits before creating a session
+            rejection = _demo_rate_limit_check(from_number)
+            if rejection:
+                _record_protection_log(
+                    db, reason="demo_rate_limited",
+                    call_sid=call_sid, from_number=from_number,
+                    to_number=to_number, call_status=call_status,
+                    ai_response=rejection, speech_input=speech,
+                )
+                db.commit()
+                return _build_terminal_voice_response(rejection)
+        else:
+            # Continuing demo call — enforce turn cap
+            if _is_demo_turn_limit_reached(existing_session):
+                farewell = "That's all for the demo! Visit our website to set up Reeva for your own business. Thanks for calling!"
+                _record_protection_log(
+                    db, reason="demo_turn_limit",
+                    call_sid=call_sid, from_number=from_number,
+                    to_number=to_number, call_status=call_status,
+                    ai_response=farewell, speech_input=speech,
+                )
+                db.commit()
+                return _build_terminal_voice_response(farewell)
+    # ── Regular rate limit (non-demo calls) ───────────────────────────────────
+    elif existing_session is None and _is_rate_limited_new_call(db, from_number):
         prompt = "We are receiving too many calls from this number right now. Please try again later."
         _record_protection_log(
             db,
@@ -1146,8 +1233,15 @@ async def voice(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/api/calls", response_model=list[CallLogOut])
-def list_calls(db: Session = Depends(get_db)):
-    rows = db.query(CallLog).order_by(CallLog.created_at.desc()).limit(100).all()
+def list_calls(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    business_id = current_user["business_id"]
+    rows = (
+        db.query(CallLog)
+        .filter(CallLog.business_id == business_id)
+        .order_by(CallLog.created_at.desc())
+        .limit(100)
+        .all()
+    )
     return rows
 
 
@@ -1161,6 +1255,103 @@ def get_settings(db: Session = Depends(get_db)):
         "booking_enabled": business.booking_enabled,
     }
 
+
+# ---------------------------------------------------------------------------
+# Auth — Google OAuth sign-in / sign-up
+# ---------------------------------------------------------------------------
+
+# Short-lived in-memory state store (mode per nonce). Fine for single-process MVP.
+# Use Redis / DB-backed storage in production.
+_oauth_states: dict[str, str] = {}  # state_nonce -> mode ("signin" | "signup")
+
+
+def _auth_callback_uri(request: Request) -> str:
+    """Derive the redirect URI from the incoming request — same pattern as the calendar flow."""
+    return str(request.url_for("auth_google_callback"))
+
+
+@app.get("/api/auth/google/start")
+def auth_google_start(mode: str = "signin", request: Request = None):
+    """Redirect the browser to Google's OAuth consent page."""
+    if mode not in ("signin", "signup"):
+        raise HTTPException(status_code=400, detail="mode must be signin or signup")
+    state = secrets.token_urlsafe(16)
+    _oauth_states[state] = mode
+    try:
+        url = create_google_auth_url(mode=mode, state=state, redirect_uri=_auth_callback_uri(request))
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return RedirectResponse(url, status_code=302)
+
+
+@app.get("/api/auth/google/callback", name="auth_google_callback")
+def auth_google_callback(code: str, state: str, request: Request, db: Session = Depends(get_db)):
+    """Handle Google's redirect, issue a session token, redirect to frontend."""
+    mode = _oauth_states.pop(state, None)
+    if mode is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+
+    try:
+        result = exchange_google_auth_code(
+            code=code,
+            state=state,
+            redirect_uri=_auth_callback_uri(request),
+            mode=mode,
+        )
+    except CalendarServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Find or create the business record for this Google account
+    business = (
+        db.query(Business)
+        .filter(Business.google_account_email == result.email)
+        .first()
+    )
+    is_new = business is None
+
+    if is_new:
+        business = Business(
+            name=result.name or result.email,  # pre-filled from Google; user can update in onboarding
+            google_account_email=result.email,
+            google_calendar_connected=result.is_calendar_authorized,
+            google_token_json=result.token_json,
+            booking_enabled=True,
+        )
+        db.add(business)
+    else:
+        # Refresh calendar tokens if Google returned them
+        if result.token_json:
+            business.google_token_json = result.token_json
+            business.google_calendar_connected = True
+
+    db.commit()
+    db.refresh(business)
+
+    token = create_session_token(
+        email=result.email,
+        name=result.name,
+        business_id=business.id,
+    )
+    destination = "/dashboard/onboarding" if is_new else "/dashboard"
+    frontend_url = f"{settings.frontend_base_url}/auth/callback?token={token}&next={destination}"
+    return RedirectResponse(frontend_url, status_code=302)
+
+
+@app.get("/api/auth/me")
+def auth_me(current_user: dict = Depends(get_current_user)):
+    """Return the current user's session payload."""
+    return current_user
+
+
+@app.post("/api/auth/logout")
+def auth_logout(response: Response):
+    response.delete_cookie("reeva_session", path="/")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Businesses
+# ---------------------------------------------------------------------------
 
 @app.post("/api/businesses", response_model=BusinessOut)
 def create_business(payload: BusinessCreate, db: Session = Depends(get_db)):
@@ -1187,6 +1378,61 @@ def create_business(payload: BusinessCreate, db: Session = Depends(get_db)):
 @app.get("/api/businesses", response_model=list[BusinessOut])
 def list_businesses(db: Session = Depends(get_db)):
     return db.query(Business).order_by(Business.created_at.desc()).all()
+
+
+@app.get("/api/businesses/me", response_model=BusinessOut)
+def get_my_business(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    """Return the business owned by the current authenticated user."""
+    return _get_business_or_404(db, current_user["business_id"])
+
+
+@app.patch("/api/businesses/me", response_model=BusinessOut)
+def update_my_business(
+    payload: BusinessPatch,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update the business owned by the current authenticated user."""
+    business = _get_business_or_404(db, current_user["business_id"])
+    business.onboarding_completed = True  # mark onboarding done on first (or any) save
+    return _apply_business_patch(business, payload, db)
+
+
+def _apply_business_patch(business: Business, payload: BusinessPatch, db: Session) -> Business:
+    """Apply a BusinessPatch to a Business row and commit. Returns the updated row."""
+    if payload.name is not None:
+        business.name = payload.name
+    if payload.twilio_number is not None:
+        number_fields = _normalize_business_numbers(
+            twilio_number=payload.twilio_number,
+            forwarding_number=business.forwarding_number,
+        )
+        business.twilio_number = number_fields["twilio_number"]
+        business.twilio_number_normalized = number_fields["twilio_number_normalized"]
+    if payload.forwarding_number is not None:
+        number_fields = _normalize_business_numbers(
+            twilio_number=business.twilio_number,
+            forwarding_number=payload.forwarding_number,
+        )
+        business.forwarding_number = number_fields["forwarding_number"]
+    if payload.greeting is not None:
+        business.greeting = payload.greeting
+    if payload.business_hours is not None:
+        business.business_hours = payload.business_hours
+    if payload.booking_enabled is not None:
+        business.booking_enabled = payload.booking_enabled
+    if payload.knowledge_text is not None:
+        business.knowledge_text = payload.knowledge_text
+    db.commit()
+    db.refresh(business)
+    return business
+
+
+@app.patch("/api/businesses/{business_id}", response_model=BusinessOut)
+def update_business(business_id: int, payload: BusinessPatch, db: Session = Depends(get_db)):
+    business = _get_business_or_404(db, business_id)
+    return _apply_business_patch(business, payload, db)
+    return business
 
 
 @app.get("/api/integrations/google/start")
@@ -1311,6 +1557,13 @@ def create_appointment(payload: AppointmentCreate, db: Session = Depends(get_db)
 
 
 @app.get("/api/appointments", response_model=list[AppointmentOut])
-def list_appointments(db: Session = Depends(get_db)):
-    rows = db.query(AppointmentRequest).order_by(AppointmentRequest.created_at.desc()).limit(100).all()
+def list_appointments(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    business_id = current_user["business_id"]
+    rows = (
+        db.query(AppointmentRequest)
+        .filter(AppointmentRequest.business_id == business_id)
+        .order_by(AppointmentRequest.created_at.desc())
+        .limit(100)
+        .all()
+    )
     return rows

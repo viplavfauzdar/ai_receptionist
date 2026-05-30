@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
 import json
 import re
 from zoneinfo import ZoneInfo
+
+# Google returns aliased scopes (e.g. userinfo.email for "email") that differ
+# from what was requested — tell oauthlib not to treat that as an error.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -15,6 +20,17 @@ from googleapiclient.discovery import build
 from .config import settings
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+# Scopes for the combined sign-up flow (identity + calendar in one consent screen)
+AUTH_SIGNUP_SCOPES = [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/calendar",
+]
+
+# Scopes for returning-user sign-in (identity only — calendar tokens already stored)
+AUTH_SIGNIN_SCOPES = ["openid", "email", "profile"]
 
 
 class CalendarServiceError(Exception):
@@ -110,9 +126,29 @@ def build_appointment_window(
     return start, end
 
 
+def _load_client_secrets() -> dict[str, str]:
+    """Read client_id and client_secret from credentials.json — never from the DB."""
+    secrets_path = Path(settings.google_client_secrets_file)
+    if not secrets_path.exists():
+        raise CalendarServiceError(f"Google client secrets file not found: {settings.google_client_secrets_file}")
+    data = json.loads(secrets_path.read_text())
+    client_data = data.get("web") or data.get("installed") or {}
+    return {"client_id": client_data.get("client_id", ""), "client_secret": client_data.get("client_secret", "")}
+
+
 def _load_credentials_from_token_json(token_json: str) -> Credentials:
     payload = json.loads(token_json)
+    # Inject client credentials from disk — strip whatever was stored in the DB
+    payload.update(_load_client_secrets())
     return Credentials.from_authorized_user_info(payload, SCOPES)
+
+
+def _strip_client_secrets(token_json: str) -> str:
+    """Remove client_id and client_secret before persisting to the DB."""
+    payload = json.loads(token_json)
+    payload.pop("client_id", None)
+    payload.pop("client_secret", None)
+    return json.dumps(payload)
 
 
 def _load_credentials(token_json: str | None = None) -> Credentials:
@@ -131,7 +167,7 @@ def _load_credentials(token_json: str | None = None) -> Credentials:
     if credentials and credentials.expired and credentials.refresh_token:
         credentials.refresh(Request())
         if token_json is None:
-            Path(settings.google_token_file).write_text(credentials.to_json())
+            Path(settings.google_token_file).write_text(_strip_client_secrets(credentials.to_json()))
         return credentials
 
     if token_json:
@@ -309,7 +345,7 @@ def exchange_google_oauth_code(*, business_id: int, code: str, redirect_uri: str
     flow.fetch_token(code=code)
     credentials = flow.credentials
     return GoogleOAuthResult(
-        token_json=credentials.to_json(),
+        token_json=_strip_client_secrets(credentials.to_json()),
         account_email=_get_google_account_email(credentials),
     )
 
@@ -333,6 +369,74 @@ def list_google_calendars(*, token_json: str) -> list[dict[str, str]]:
     return calendars
 
 
+@dataclass
+class GoogleAuthResult:
+    """Result of the combined sign-up OAuth flow."""
+    email: str
+    name: str | None
+    token_json: str | None      # calendar tokens — None for sign-in (identity only)
+    is_calendar_authorized: bool
+
+
+def _build_auth_flow(*, scopes: list[str], redirect_uri: str, state: str) -> Flow:
+    secrets_path = Path(settings.google_client_secrets_file)
+    if not secrets_path.exists():
+        raise CalendarServiceError(f"Google client secrets file not found: {settings.google_client_secrets_file}")
+    flow = Flow.from_client_secrets_file(str(secrets_path), scopes, state=state)
+    flow.redirect_uri = redirect_uri
+    return flow
+
+
+def create_google_auth_url(*, mode: str, state: str, redirect_uri: str) -> str:
+    """
+    Generate Google OAuth URL.
+    mode='signup'  → requests identity + calendar scopes
+    mode='signin'  → requests identity scopes only
+    """
+    scopes = AUTH_SIGNUP_SCOPES if mode == "signup" else AUTH_SIGNIN_SCOPES
+    flow = _build_auth_flow(scopes=scopes, redirect_uri=redirect_uri, state=state)
+    url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="false",
+    )
+    return url
+
+
+def exchange_google_auth_code(*, code: str, state: str, redirect_uri: str, mode: str = "signup") -> GoogleAuthResult:
+    """
+    Exchange auth code. Detects whether calendar scope was granted based on returned scopes.
+    Returns identity + optionally calendar tokens.
+    mode: "signup" (identity + calendar scopes) or "signin" (identity scopes only)
+    """
+    scopes = AUTH_SIGNUP_SCOPES if mode == "signup" else AUTH_SIGNIN_SCOPES
+    try:
+        flow = _build_auth_flow(scopes=scopes, redirect_uri=redirect_uri, state=state)
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        raise CalendarServiceError(f"Failed to exchange Google auth code: {exc}") from exc
+
+    credentials = flow.credentials
+    granted = set(credentials.scopes or [])
+    has_calendar = "https://www.googleapis.com/auth/calendar" in granted
+
+    # Get identity via userinfo API
+    try:
+        service = build("oauth2", "v2", credentials=credentials)
+        profile = service.userinfo().get().execute()
+        email = str(profile.get("email", ""))
+        name = profile.get("name") or profile.get("given_name")
+    except Exception as exc:
+        raise CalendarServiceError(f"Could not fetch Google user info: {exc}") from exc
+
+    return GoogleAuthResult(
+        email=email,
+        name=str(name) if name else None,
+        token_json=_strip_client_secrets(credentials.to_json()) if has_calendar else None,
+        is_calendar_authorized=has_calendar,
+    )
+
+
 def run_local_oauth_authorization() -> Credentials:
     secrets_path = Path(settings.google_client_secrets_file)
     if not secrets_path.exists():
@@ -340,7 +444,7 @@ def run_local_oauth_authorization() -> Credentials:
 
     flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
     credentials = flow.run_local_server(port=0)
-    Path(settings.google_token_file).write_text(credentials.to_json())
+    Path(settings.google_token_file).write_text(_strip_client_secrets(credentials.to_json()))
     return credentials
 
 

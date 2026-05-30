@@ -31,8 +31,17 @@ class Settings(BaseSettings):
     google_oauth_redirect_uri: str = ""
     google_timezone: str = "America/New_York"
     appointment_duration_minutes: int = 30
+    auth_secret_key: str = "change-me-in-production"
+    auth_token_expire_hours: int = 72
+    app_base_url: str = "http://localhost:8000"
+    frontend_base_url: str = "http://localhost:3000"
     twilio_auth_token: str = ""
+    twilio_account_sid: str = ""
     disable_twilio_signature_validation: bool = False
+    demo_twilio_number: str = ""                    # E.164 — leave blank to disable demo
+    demo_max_calls_per_number_per_hour: int = 2     # per calling number
+    demo_max_calls_per_day_total: int = 20          # global daily ceiling
+    demo_max_turns: int = 5                         # hang up after this many turns
     cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     database_url: str = "sqlite:///./receptionist.db"
     business_name: str = "Bright Smile Dental"

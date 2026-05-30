@@ -56,8 +56,16 @@ class BusinessCreate(BaseModel):
     knowledge_text: str | None = None
 
 
-class BusinessOut(BusinessCreate):
+class BusinessOut(BaseModel):
     id: int
+    name: str
+    twilio_number: str | None = None   # nullable — not set until onboarding
+    forwarding_number: str | None = None
+    greeting: str | None = None
+    business_hours: str | None = None
+    booking_enabled: bool = True
+    onboarding_completed: bool = False
+    knowledge_text: str | None = None
     google_calendar_connected: bool = False
     google_account_email: str | None = None
     google_calendar_id: str | None = None
@@ -65,6 +73,16 @@ class BusinessOut(BusinessCreate):
 
     class Config:
         from_attributes = True
+
+
+class BusinessPatch(BaseModel):
+    name: str | None = None
+    twilio_number: str | None = None   # settable from onboarding (first-time setup)
+    forwarding_number: str | None = None
+    greeting: str | None = None
+    business_hours: str | None = None
+    booking_enabled: bool | None = None
+    knowledge_text: str | None = None
 
 
 class GoogleCalendarSelection(BaseModel):
