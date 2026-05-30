@@ -1,7 +1,13 @@
+import { authHeaders } from "@/lib/server-auth";
+
+const BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+
 async function getCalls() {
-  const base = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
   try {
-    const res = await fetch(`${base}/api/calls`, { cache: "no-store" });
+    const res = await fetch(`${BASE}/api/calls`, {
+      cache: "no-store",
+      headers: authHeaders(),
+    });
     return res.ok ? res.json() : [];
   } catch {
     return [];
@@ -9,9 +15,11 @@ async function getCalls() {
 }
 
 async function getAppointments() {
-  const base = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
   try {
-    const res = await fetch(`${base}/api/appointments`, { cache: "no-store" });
+    const res = await fetch(`${BASE}/api/appointments`, {
+      cache: "no-store",
+      headers: authHeaders(),
+    });
     return res.ok ? res.json() : [];
   } catch {
     return [];
@@ -93,7 +101,7 @@ export default async function HomePage() {
                     <td className="px-6 py-3 font-mono text-xs text-gray-700 whitespace-nowrap">{row.from_number || "—"}</td>
                     <td className="px-6 py-3 text-gray-600 max-w-[200px] truncate">{row.speech_input || "—"}</td>
                     <td className="px-6 py-3 text-gray-600 max-w-[240px] truncate">{row.ai_response || "—"}</td>
-                    <td className="px-6 py-3"><IntentBadge intent={row.intent} /></td>
+                    <td className="px-6 py-3"><IntentBadge intent={row.detected_intent} /></td>
                     <td className="px-6 py-3 text-gray-400 whitespace-nowrap text-xs">{new Date(row.created_at).toLocaleString()}</td>
                   </tr>
                 ))
